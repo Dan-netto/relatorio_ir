@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+gunicorn
+SQLAlchemy
+python-dotenv
+pandas
+numpy
+scipy
+yfinance
+psycopg2==2.9.10
