@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 fastapi
 uvicorn
 gunicorn
@@ -7,4 +8,15 @@ pandas
 numpy
 scipy
 yfinance
+=======
+fastapi
+uvicorn
+gunicorn
+SQLAlchemy
+python-dotenv
+pandas
+numpy
+scipy
+yfinance
+>>>>>>> 9dd6009c6d2e7db6a70da384255a62cae527fb38
 psycopg2==2.9.10
