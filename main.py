@@ -589,7 +589,7 @@ def _gerar_carteira_cache():
         "Preço Médio Ajustado": "preco_medio",
         "Dividendo": "dividendos",
         "Juros Sobre Capital Próprio": "juros_sobre_capital_proprio",
-        'Total Vendido': "total_investido"
+        'Total Investido': "total_investido"
     })
     cnpj_b3['Ticker'] = cnpj_b3['Ticker'].str.split(' ')
 
