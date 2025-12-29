@@ -1,0 +1,23 @@
+# Ambientes Virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Python Cache
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Variáveis de Ambiente (SENSÍVEL - Nunca subir)
+.env
+.env.local
+
+# Banco de Dados Local (se usar SQLite)
+*.sqlite3
+*.db
+
+# Heroku e IDEs
+.heroku/
+.vscode/
+.idea/

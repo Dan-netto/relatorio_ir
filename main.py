@@ -576,12 +576,12 @@ def _gerar_carteira_cache():
     desdobros, subscricoes, subscricoes_original, bonus, bonus_original, leilao, leilao_original = processar_eventos(df_mov)
     ajuste_grupamento = aplicar_grupamentos(df_neg)
     df_carteira = consolidar_carteira(df_mov, df_neg, desdobros, subscricoes, bonus, leilao, ajuste_grupamento)
-    # df_carteira_filtrada = df_carteira[df_carteira['Qtd Final'] > 0].copy()
+    df_carteira_filtrada = df_carteira[df_carteira['Qtd Final'] > 0].copy()
 
     # ---- Cálculos resumidos ----
     df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento)
     proventos_pivot_ir = calcular_proventos_ir(df_mov)
-    df = df_carteira.iloc[:-1].merge(proventos_pivot_ir, on="Ticker", how="left").fillna(0)
+    df = df_carteira_filtrada.iloc[:-1].merge(proventos_pivot_ir, on="Ticker", how="left").fillna(0)
 
     # ---- Ajuste de nomes ----
     df = df.rename(columns={
@@ -591,6 +591,15 @@ def _gerar_carteira_cache():
         "Juros Sobre Capital Próprio": "juros_sobre_capital_proprio",
         'Total Vendido': "total_investido"
     })
+    cnpj_b3['Ticker'] = cnpj_b3['Ticker'].str.split(' ')
+
+    # 2. "Explodir" a coluna Ticker para que cada item da lista ganhe uma linha própria
+    # O Pandas irá repetir o CNPJ e a Razão Social para cada novo Ticker gerado
+    cnpj_b3 = cnpj_b3.explode('Ticker')
+
+    # 3. Limpeza adicional: remover espaços em branco que possam ter sobrado e linhas vazias
+    cnpj_b3['Ticker'] = cnpj_b3['Ticker'].str.strip()
+    cnpj_b3 = cnpj_b3[cnpj_b3['Ticker'] != '']
     
     json_final = gerar_json_ir(df, cnpj_b3, df_lucros)
     return json_final
