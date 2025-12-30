@@ -55,9 +55,17 @@ def normalizar_ticker(ticker):
     return re.sub(r"F$", "", str(ticker).strip())
 
 # ---------------- ETAPAS DO PIPELINE ----------------
-def carregar_dados():
-    df_mov = pd.read_sql("SELECT * FROM ldinvest_movimentacao_07122025", con=engine)
-    df_neg = pd.read_sql("SELECT * FROM ldinvest_negociacao_07122025", con=engine)
+def carregar_dados(ano):
+    # Definimos a data limite: 31 de dezembro do ano informado
+    data_limite = f"{ano}-12-31"
+    
+    # Query com filtro WHERE para limitar a data
+    # Substitua 'data_coluna' pelo nome real da coluna de data nas suas tabelas
+    query_mov = f"SELECT * FROM ldinvest_movimentacao_07122025 WHERE data_coluna <= '{data_limite}'"
+    query_neg = f"SELECT * FROM ldinvest_negociacao_07122025 WHERE data_coluna <= '{data_limite}'"
+    
+    df_mov = pd.read_sql(query_mov, con=engine)
+    df_neg = pd.read_sql(query_neg, con=engine)
     cnpj_b3 = pd.read_sql("SELECT * FROM cnpj_b3", con=engine)
     return df_mov, df_neg, cnpj_b3
 
@@ -223,92 +231,89 @@ def consolidar_carteira(df_mov, df_neg, desdobros, subscricoes, bonus, leilao, a
 
     return(df_carteira)
 
-def calcular_evolucao_temporal_jcp(df_mov):
-    # 1. Garantir que a coluna Data é datetime
-    df_mov['Data'] = pd.to_datetime(df_mov['Data'], dayfirst=True)
+# def calcular_evolucao_temporal_jcp(df_mov):
+#     # 1. Garantir que a coluna Data é datetime
+#     df_mov['Data'] = pd.to_datetime(df_mov['Data'], dayfirst=True)
 
-    # 2. Filtrar apenas JCP
-    proventos = df_mov[df_mov['Movimentação'].isin(['Juros Sobre Capital Próprio'])].copy()
+#     # 2. Filtrar apenas JCP
+#     proventos = df_mov[df_mov['Movimentação'].isin(['Juros Sobre Capital Próprio'])].copy()
     
-    # 3. Agrupar e preparar a série temporal
-    proventos = proventos.groupby(['Data', 'Movimentação'])['Valor da Operação'].sum().reset_index()
-    proventos_ts = proventos.pivot_table(index='Data', columns='Movimentação', values='Valor da Operação', fill_value=0)
+#     # 3. Agrupar e preparar a série temporal
+#     proventos = proventos.groupby(['Data', 'Movimentação'])['Valor da Operação'].sum().reset_index()
+#     proventos_ts = proventos.pivot_table(index='Data', columns='Movimentação', values='Valor da Operação', fill_value=0)
     
-    if proventos_ts.empty:
-        return {"ano_calendario_ir": 0.0, "total_acumulado": 0.0}
+#     if proventos_ts.empty:
+#         return {"ano_calendario_ir": 0.0, "total_acumulado": 0.0}
 
-    proventos_ts['Total Proventos'] = proventos_ts.sum(axis=1)
-    proventos_ts = proventos_ts.reset_index()
+#     proventos_ts['Total Proventos'] = proventos_ts.sum(axis=1)
+#     proventos_ts = proventos_ts.reset_index()
 
-    # 4. Definição dos Períodos
-    hoje = datetime.today()
+#     # 4. Definição dos Períodos
+#     hoje = datetime.today()
     
-    # Lógica para IR: 01/01 do ano passado até 31/12 do ano passado
-    ano_anterior = hoje.year - 1
-    inicio_ir = pd.Timestamp(year=ano_anterior, month=1, day=1)
-    fim_ir = pd.Timestamp(year=ano_anterior, month=12, day=31)
+#     # Lógica para IR: 01/01 do ano passado até 31/12 do ano passado
+#     ano_anterior = hoje.year - 1
+#     inicio_ir = pd.Timestamp(year=ano_anterior, month=1, day=1)
+#     fim_ir = pd.Timestamp(year=ano_anterior, month=12, day=31)
 
-    # 5. Filtros
-    filtros = {
-        "ano_calendario_ir": proventos_ts[(proventos_ts['Data'] >= inicio_ir) & (proventos_ts['Data'] <= fim_ir)],
-        "mes_atual": proventos_ts[proventos_ts['Data'] >= hoje.replace(day=1)],
-        "desde_inicio": proventos_ts
-    }
+#     # 5. Filtros
+#     filtros = {
+#         "ano_calendario_ir": proventos_ts[(proventos_ts['Data'] >= inicio_ir) & (proventos_ts['Data'] <= fim_ir)],
+#         "mes_atual": proventos_ts[proventos_ts['Data'] >= hoje.replace(day=1)],
+#         "desde_inicio": proventos_ts
+#     }
 
-    return {
-        periodo: float(filtro['Total Proventos'].sum())
-        for periodo, filtro in filtros.items()
-    }
+#     return {
+#         periodo: float(filtro['Total Proventos'].sum())
+#         for periodo, filtro in filtros.items()
+#     }
 
-def calcular_evolucao_temporal_Dividendo(df_mov):
-    # 1. Garantir que a coluna Data é datetime para evitar erros de comparação
-    df_mov['Data'] = pd.to_datetime(df_mov['Data'], dayfirst=True)
+# def calcular_evolucao_temporal_Dividendo(df_mov):
+#     # 1. Garantir que a coluna Data é datetime para evitar erros de comparação
+#     df_mov['Data'] = pd.to_datetime(df_mov['Data'], dayfirst=True)
 
-    # 2. Filtrar apenas Movimentações de 'Dividendo'
-    proventos = df_mov[df_mov['Movimentação'].isin(['Dividendo'])].copy()
+#     # 2. Filtrar apenas Movimentações de 'Dividendo'
+#     proventos = df_mov[df_mov['Movimentação'].isin(['Dividendo'])].copy()
     
-    # 3. Agrupar e preparar a série temporal
-    proventos = proventos.groupby(['Data', 'Movimentação'])['Valor da Operação'].sum().reset_index()
+#     # 3. Agrupar e preparar a série temporal
+#     proventos = proventos.groupby(['Data', 'Movimentação'])['Valor da Operação'].sum().reset_index()
     
-    # Tratamento caso o DataFrame esteja vazio
-    if proventos.empty:
-        return {"ano_calendario_ir": 0.0, "total_acumulado": 0.0}
+#     # Tratamento caso o DataFrame esteja vazio
+#     if proventos.empty:
+#         return {"ano_calendario_ir": 0.0, "total_acumulado": 0.0}
         
-    proventos_ts = proventos.pivot_table(index='Data', columns='Movimentação', values='Valor da Operação', fill_value=0)
-    proventos_ts['Total Proventos'] = proventos_ts.sum(axis=1)
-    proventos_ts = proventos_ts.reset_index()
+#     proventos_ts = proventos.pivot_table(index='Data', columns='Movimentação', values='Valor da Operação', fill_value=0)
+#     proventos_ts['Total Proventos'] = proventos_ts.sum(axis=1)
+#     proventos_ts = proventos_ts.reset_index()
 
-    # 4. Definição do Período de Imposto de Renda (Ano-Calendário)
-    hoje = datetime.today()
-    ano_anterior = hoje.year - 1
+#     # 4. Definição do Período de Imposto de Renda (Ano-Calendário)
+#     hoje = datetime.today()
+#     ano_anterior = hoje.year - 1
     
-    inicio_ir = pd.Timestamp(year=ano_anterior, month=1, day=1)
-    fim_ir = pd.Timestamp(year=ano_anterior, month=12, day=31)
-    inicio_mes_atual = hoje.replace(day=1)
+#     inicio_ir = pd.Timestamp(year=ano_anterior, month=1, day=1)
+#     fim_ir = pd.Timestamp(year=ano_anterior, month=12, day=31)
+#     inicio_mes_atual = hoje.replace(day=1)
 
-    # 5. Aplicação dos filtros temporais
-    filtros = {
-        "ano_calendario_ir": proventos_ts[(proventos_ts['Data'] >= inicio_ir) & (proventos_ts['Data'] <= fim_ir)],
-        "mes_atual": proventos_ts[proventos_ts['Data'] >= inicio_mes_atual],
-        "um_ano": proventos_ts[proventos_ts['Data'] >= hoje - pd.DateOffset(years=1)],
-        "desde_inicio": proventos_ts
-    }
+#     # 5. Aplicação dos filtros temporais
+#     filtros = {
+#         "ano_calendario_ir": proventos_ts[(proventos_ts['Data'] >= inicio_ir) & (proventos_ts['Data'] <= fim_ir)],
+#         "mes_atual": proventos_ts[proventos_ts['Data'] >= inicio_mes_atual],
+#         "um_ano": proventos_ts[proventos_ts['Data'] >= hoje - pd.DateOffset(years=1)],
+#         "desde_inicio": proventos_ts
+#     }
 
-    return {
-        periodo: float(filtro['Total Proventos'].sum())
-        for periodo, filtro in filtros.items()
-    }
+#     return {
+#         periodo: float(filtro['Total Proventos'].sum())
+#         for periodo, filtro in filtros.items()
+#     }
 
-def gerar_json_ir(df, cnpj_b3, df_lucros):
+def gerar_json_ir(df, cnpj_b3, df_lucros, ano):
     """
     Consolida os dados para o Relatório de IR.
     df_carteira_filtrada: Contém quantidade, preco_medio, total_investido, Dividendo, Juros Sobre Capital Próprio
     cnpj_b3: Tabela de de-para Ticker -> CNPJ e Razão Social
     df_lucros: Histórico de vendas com coluna 'lucro' e 'Data do Negócio'
     """
-    
-    hoje = datetime.today()
-    ano_anterior = hoje.year - 1
 
     # --- 1. PREPARAÇÃO DA CARTEIRA (Bens e Direitos + Proventos) ---
     
@@ -331,7 +336,7 @@ def gerar_json_ir(df, cnpj_b3, df_lucros):
     
     # Garantir que a data está no formato correto e filtrar o ano anterior
     df_lucros['Data do Negócio'] = pd.to_datetime(df_lucros['Data do Negócio'])
-    df_lucros_ir = df_lucros[df_lucros['Data do Negócio'].dt.year == ano_anterior].copy()
+    df_lucros_ir = df_lucros[df_lucros['Data do Negócio'].dt.year == ano].copy()
     
     # Criar um esqueleto dos 12 meses para garantir que o JSON tenha todos, mesmo com lucro zero
     meses_nomes = {
@@ -351,19 +356,17 @@ def gerar_json_ir(df, cnpj_b3, df_lucros):
 
     # --- 3. MONTAGEM DO JSON FINAL ---
     return {
-        "ano_referencia": ano_anterior,
+        "ano_referencia": ano,
         "carteira_ir": lista_carteira,
         "lucros_mensais": lista_lucros_mensais
     }
 
-def calcular_proventos_ir(df_mov):
+def calcular_proventos_ir(df_mov, ano):
     # 1. Preparação das datas
     df_mov['Data'] = pd.to_datetime(df_mov['Data'], dayfirst=True)
     
-    hoje = datetime.today()
-    ano_anterior = hoje.year - 1
-    inicio_ir = pd.Timestamp(year=ano_anterior, month=1, day=1)
-    fim_ir = pd.Timestamp(year=ano_anterior, month=12, day=31)
+    inicio_ir = pd.Timestamp(year=ano, month=1, day=1)
+    fim_ir = pd.Timestamp(year=ano, month=12, day=31)
 
     # 2. Filtro de Período (Ano-Calendário) e Tipos de Proventos
     tipos_proventos = ['Juros Sobre Capital Próprio', 'Dividendo', 'Rendimento']
