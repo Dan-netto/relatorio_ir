@@ -342,8 +342,8 @@ def gerar_json_ir(df, cnpj_b3, df_lucros, ano):
     
     # Selecionamos e renomeamos apenas as colunas que o front vai usar
     carteira_ir = df_ir.rename(columns={
-        'Razão Social': 'Razao_Social'
-    })[['Ticker', 'CNPJ', 'Razao_Social', 'quantidade', 'preco_medio', 'total_investido', 'dividendos', 'juros_sobre_capital_proprio']]
+        'Razão Social': 'Razao_Social','Instituição':'corretora',
+    })[['Ticker', 'CNPJ', 'Razao_Social', 'quantidade', 'preco_medio', 'total_investido', 'dividendos', 'juros_sobre_capital_proprio','corretora']]
     
     # Converter para lista de dicionários
     lista_carteira = carteira_ir.to_dict(orient='records')
@@ -352,7 +352,7 @@ def gerar_json_ir(df, cnpj_b3, df_lucros, ano):
     
     # Garantir que a data está no formato correto e filtrar o ano anterior
     df_lucros['Data do Negócio'] = pd.to_datetime(df_lucros['Data do Negócio'])
-    df_lucros_ir = df_lucros[df_lucros['Data do Negócio'].dt.year == ano].copy()
+    df_lucros_ir = df_lucros[df_lucros['Data do Negócio'].dt.year == int(ano)].copy()
     
     # Criar um esqueleto dos 12 meses para garantir que o JSON tenha todos, mesmo com lucro zero
     meses_nomes = {
@@ -600,8 +600,9 @@ def _gerar_carteira_cache():
     # ---- Cálculos resumidos ----
     df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento)
     proventos_pivot_ir = calcular_proventos_ir(df_mov,ano)
-    df = df_carteira_filtrada.iloc[:-1].merge(proventos_pivot_ir, on="Ticker", how="left").fillna(0)
-
+    df_ultima_corretora = df_mov.sort_values('Data').groupby('Ticker').last()['Instituição']
+    df = df_carteira_filtrada.merge(proventos_pivot_ir, on="Ticker", how="left").fillna(0)
+    df = df.merge(df_ultima_corretora, on="Ticker", how="left").fillna(0)
     # ---- Ajuste de nomes ----
     df = df.rename(columns={
         "Qtd Final": "quantidade",
