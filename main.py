@@ -59,14 +59,30 @@ def carregar_dados(ano):
     # Definimos a data limite: 31 de dezembro do ano informado
     data_limite = f"{ano}-12-31"
     
-    # Query com filtro WHERE para limitar a data
-    # Substitua 'data_coluna' pelo nome real da coluna de data nas suas tabelas
-    query_mov = f"SELECT * FROM ldinvest_movimentacao_07122025 WHERE data_coluna <= '{data_limite}'"
-    query_neg = f"SELECT * FROM ldinvest_negociacao_07122025 WHERE data_coluna <= '{data_limite}'"
-    
-    df_mov = pd.read_sql(query_mov, con=engine)
-    df_neg = pd.read_sql(query_neg, con=engine)
+    df_mov = pd.read_sql("SELECT * FROM ldinvest_movimentacao_07122025", con=engine)
+    df_neg = pd.read_sql("SELECT * FROM ldinvest_negociacao_07122025", con=engine)
     cnpj_b3 = pd.read_sql("SELECT * FROM cnpj_b3", con=engine)
+
+    data_limite = pd.to_datetime(f"{ano}-12-31")  # Substitua pelo nome real da sua coluna
+
+    def processar_e_filtrar(df,coluna_data):
+        if df.empty:
+            return df
+        
+        # Converte para datetime para poder filtrar (dayfirst=True para formato BR)
+        df[coluna_data] = pd.to_datetime(df[coluna_data], dayfirst=True)
+        
+        # Filtra os dados
+        df_filtrado = df[df[coluna_data] <= data_limite].copy()
+        
+        # Converte de volta para texto no formato DD/MM/YYYY
+        # (Ou use '%Y-%m-%d' se o formato original era o americano)
+        df_filtrado[coluna_data] = df_filtrado[coluna_data].dt.strftime('%d/%m/%Y')
+        
+        return df_filtrado
+
+    df_mov = processar_e_filtrar(df_mov, 'Data')
+    df_neg = processar_e_filtrar(df_neg,'Data do Negócio')
     return df_mov, df_neg, cnpj_b3
 
 def preparar_dados(df_mov, df_neg):
@@ -365,8 +381,8 @@ def calcular_proventos_ir(df_mov, ano):
     # 1. Preparação das datas
     df_mov['Data'] = pd.to_datetime(df_mov['Data'], dayfirst=True)
     
-    inicio_ir = pd.Timestamp(year=ano, month=1, day=1)
-    fim_ir = pd.Timestamp(year=ano, month=12, day=31)
+    inicio_ir = pd.Timestamp(year=int(ano), month=1, day=1)
+    fim_ir = pd.Timestamp(year=int(ano), month=12, day=31)
 
     # 2. Filtro de Período (Ano-Calendário) e Tipos de Proventos
     tipos_proventos = ['Juros Sobre Capital Próprio', 'Dividendo', 'Rendimento']
@@ -572,9 +588,9 @@ _last_cache_time = datetime.min
 # ===============================
 @lru_cache(maxsize=1)
 def _gerar_carteira_cache():
-    print("♻️  Recalculando carteira completa...")
-
-    df_mov, df_neg, cnpj_b3 = carregar_dados()
+    print("♻️  Recalculando declaração...")
+    ano='2024'
+    df_mov, df_neg, cnpj_b3 = carregar_dados(ano)
     df_mov, df_neg = preparar_dados(df_mov, df_neg)
     desdobros, subscricoes, subscricoes_original, bonus, bonus_original, leilao, leilao_original = processar_eventos(df_mov)
     ajuste_grupamento = aplicar_grupamentos(df_neg)
@@ -583,7 +599,7 @@ def _gerar_carteira_cache():
 
     # ---- Cálculos resumidos ----
     df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento)
-    proventos_pivot_ir = calcular_proventos_ir(df_mov)
+    proventos_pivot_ir = calcular_proventos_ir(df_mov,ano)
     df = df_carteira_filtrada.iloc[:-1].merge(proventos_pivot_ir, on="Ticker", how="left").fillna(0)
 
     # ---- Ajuste de nomes ----
@@ -604,7 +620,7 @@ def _gerar_carteira_cache():
     cnpj_b3['Ticker'] = cnpj_b3['Ticker'].str.strip()
     cnpj_b3 = cnpj_b3[cnpj_b3['Ticker'] != '']
     
-    json_final = gerar_json_ir(df, cnpj_b3, df_lucros)
+    json_final = gerar_json_ir(df, cnpj_b3, df_lucros,ano)
     return json_final
 
     # ---- Retorno padronizado ----
