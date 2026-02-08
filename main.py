@@ -1364,6 +1364,7 @@ def _gerar_carteira_cache():
     df = df[['Ticker','Dividendo','Juros Sobre Capital Próprio','Reembolso','Rendimento_fii','Rendimento_acoes']].fillna(0)
 
     df_historico_negociacoes=historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo)
+    df_historico_negociacoes['Link_PDF'] = df_historico_negociacoes['Link_PDF'].fillna('-')
     df_historico_proventos=historico_proventos(df_ir,df_mov,df_lucros_novo,ano_fiscal)
 
         
