@@ -753,7 +753,7 @@ def calcular_proventos_ir(df_mov,ano_fiscal):
 
     return df_pivot_rend
 
-def calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico):
+def calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao):
 
 
     vendas = df_neg[df_neg['Tipo de Movimentação'] == 'Venda']
@@ -1354,7 +1354,7 @@ def _gerar_carteira_cache():
     # df_carteira_filtrada = df_carteira[df_carteira['Qtd Final'] > 0].copy()
 
     # ---- Cálculos resumidos ----
-    df_lucros_novo = calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico)
+    df_lucros_novo = calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao)
     # df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento,cnpj_b3)
 
     proventos_pivot_ir = calcular_proventos_ir(df_mov,ano_fiscal)
