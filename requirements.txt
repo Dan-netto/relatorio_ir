@@ -9,3 +9,4 @@ scipy
 yfinance
 psycopg2==2.9.10
 pdfplumber
+exchange_calendars
