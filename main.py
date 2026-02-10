@@ -60,7 +60,7 @@ def raiz_ticker(ticker):
     return str(ticker).strip()[:4].upper()
 
 def carregar_dados():
-        df_mov = pd.read_sql("SELECT * FROM ldinvest_movimentacao_21092025", con=engine)
+        df_mov = pd.read_sql("SELECT * FROM movimentacao_anna", con=engine)
         # df_neg = pd.read_sql("SELECT * FROM ldinvest_negociacao_21092025", con=engine)
         cnpj_b3 = pd.read_sql("SELECT * FROM cnpj_b3_total", con=engine)
         df_subscricao = pd.read_sql("SELECT * FROM base_precos_subscricao_total", con=engine)
@@ -709,7 +709,7 @@ def calcular_proventos_ir(df_mov,ano_fiscal):
     fim_ir = pd.Timestamp(year=int(ano_fiscal), month=12, day=31)
 
     # 2. Filtro de Período (Ano-Calendário) e Tipos de Proventos
-    tipos_proventos = ['Juros Sobre Capital Próprio', 'Dividendo','Reembolso']
+    tipos_proventos = ['Juros Sobre Capital Próprio', 'Dividendo','Reembolso','Rendimento']
     
     mask = (
         (df_mov['Data'] >= inicio_ir) & 
@@ -1062,13 +1062,13 @@ def historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo):
     df_neg['Data do Negócio'] = pd.to_datetime(df_neg['Data do Negócio'], errors='coerce', dayfirst=True)
     df_mov['Data'] = pd.to_datetime(df_mov['Data'], errors='coerce', dayfirst=True)
 
-    df_mov['Ticker_Ajustado'] = df_mov['Ticker'].apply(
+    df_mov['Ticker'] = df_mov['Ticker'].apply(
         lambda x: resolver_ticker_mae(x, tickers_set)
     )
 
     # ---------- 2) Filtro inicial por tickers ----------
     df_neg_f = df_neg[df_neg['Ticker'].isin(tickers_set)].copy()
-    df_mov_f = df_mov[df_mov['Ticker_Ajustado'].isin(tickers_set)].copy()
+    df_mov_f = df_mov[df_mov['Ticker'].isin(tickers_set)].copy()
 
     # ---------- 3) Remover movimentações específicas em df_mov ----------
     # Remove "Empréstimo" e "Transferência - Liquidação"
@@ -1342,6 +1342,32 @@ def _gerar_carteira_cache():
 
     tickers_afetados_incorporacao,df_carteira_final_historico = processar_fluxo_historico(df_neg,df_mov,cnpj_b3,ano_fiscal)
     df_carteira_final=df_carteira_final_historico[-1]
+
+    # ---- Cálculos resumidos ----
+    df_lucros_novo = calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao)
+    # df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento,cnpj_b3)
+    df_lucros_novo['Data do Negócio'] = pd.to_datetime(df_lucros_novo['Data do Negócio'])
+
+    # 2. Criar pivôs para encontrar a última data de cada tipo de venda por Ticker
+    # Usamos 'max' para pegar a data mais recente
+    ultimas_vendas = df_lucros_novo.groupby(['Ticker', 'tipo venda'])['Data do Negócio'].max().unstack()
+
+    # O unstack() vai criar colunas 'venda parcial' e 'venda total'
+    # Vamos preencher valores nulos (caso um ticker nunca tenha tido um dos tipos) com uma data muito antiga
+    ultimas_vendas = ultimas_vendas.fillna(pd.Timestamp('1900-01-01'))
+
+    # 3. Filtrar: A última parcial deve ser depois da última total 
+    # (ou apenas existir parcial e nenhuma total)
+    tickers_filtrados = ultimas_vendas[
+        ultimas_vendas['venda parcial'] > ultimas_vendas['venda total']
+    ].index
+
+    # Garantimos que os tickers_filtrados sejam uma lista ou conjunto para a busca
+    lista_alvo = list(tickers_filtrados)
+
+    # Aplicamos a lógica: se o Ticker está na lista, 
+    # Total Investido = Total Investido - Total Vendido
+    df_carteira_final.loc[df_carteira_final['Ticker'].isin(lista_alvo), 'Total Investido'] -= df_carteira_final['Total Vendido']
     # desdobros, subscricoes, subscricoes_original, bonus, bonus_original, leilao, leilao_original = processar_eventos(df_mov)
     # ajuste_grupamento = aplicar_grupamentos(df_mov, df_neg, desdobros, subscricoes, bonus, leilao, cnpj_b3)
     # df = consolidar_carteira(df_neg, desdobros, subscricoes, bonus, leilao)
@@ -1353,9 +1379,6 @@ def _gerar_carteira_cache():
     df_carteira = cisao(df_carteira,df_mov)
     # df_carteira_filtrada = df_carteira[df_carteira['Qtd Final'] > 0].copy()
 
-    # ---- Cálculos resumidos ----
-    df_lucros_novo = calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao)
-    # df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento,cnpj_b3)
 
     proventos_pivot_ir = calcular_proventos_ir(df_mov,ano_fiscal)
     df = df_carteira.iloc[:-1].merge(proventos_pivot_ir, on="Ticker", how="left")
@@ -1370,14 +1393,14 @@ def _gerar_carteira_cache():
         
 
     # ---- Ajuste de nomes ----
-    df = df.rename(columns={
-        "Qtd Final": "quantidade",
-        "Preço Médio Ajustado": "preco_medio",
-        "Dividendo": "dividendos",
-        "Juros Sobre Capital Próprio": "juros_sobre_capital_proprio",
-        'Total Vendido': "total_investido",
-        'Qtd Vendida': "quantidade_vendida",
-    })
+    # df = df.rename(columns={
+    #     "Qtd Final": "quantidade",
+    #     "Preço Médio Ajustado": "preco_medio",
+    #     "Dividendo": "dividendos",
+    #     "Juros Sobre Capital Próprio": "juros_sobre_capital_proprio",
+    #     'Total Vendido': "total_investido",
+    #     'Qtd Vendida': "quantidade_vendida",
+    # })
     
     
     json_final = gerar_json_ir(df_ir, df, cnpj_b3, df_lucros_novo, df_historico_negociacoes, df_historico_proventos, ano_fiscal)
