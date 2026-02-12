@@ -21,6 +21,7 @@ import pdfplumber
 from collections import Counter
 import unicodedata
 import exchange_calendars as ecals
+import math
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
@@ -60,7 +61,7 @@ def raiz_ticker(ticker):
     return str(ticker).strip()[:4].upper()
 
 def carregar_dados():
-        df_mov = pd.read_sql("SELECT * FROM movimentacao_anna", con=engine)
+        df_mov = pd.read_sql("SELECT * FROM ldinvest_movimentacao_21092025", con=engine)
         # df_neg = pd.read_sql("SELECT * FROM ldinvest_negociacao_21092025", con=engine)
         cnpj_b3 = pd.read_sql("SELECT * FROM cnpj_b3_total", con=engine)
         df_subscricao = pd.read_sql("SELECT * FROM base_precos_subscricao_total", con=engine)
@@ -245,10 +246,20 @@ def verificar_origem_aluguel(row,emp_df,janela_dias=5):
 def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
     tipos_eventos = ['Desdobro', 'Grupamento', 'Incorporação', 
                      'Direitos de Subscrição - Exercido', 'Bonificação em Ativos']
+
+    tipos_eventos_neg=['Venda']
     
     fila_eventos = df_mov[df_mov['Movimentação'].isin(tipos_eventos)].copy()
+    fila_eventos_neg = df_neg[df_neg['Tipo de Movimentação'].isin(tipos_eventos_neg)].copy()
     fila_eventos['Data_DT'] = pd.to_datetime(fila_eventos['Data'], dayfirst=True)
-    datas_eventos = sorted(fila_eventos['Data_DT'].unique())
+    fila_eventos_neg['Data_DT'] = pd.to_datetime(fila_eventos_neg['Data do Negócio'], dayfirst=True)
+    datas_eventos = sorted(
+    pd.concat([
+        fila_eventos['Data_DT'],
+        fila_eventos_neg['Data_DT']
+    ]).unique()
+    )
+
     tickers_afetados_incorporacao = []
     historico_snapshots = []
     
@@ -260,7 +271,8 @@ def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
     data_inicio = pd.to_datetime('1900-01-01')
 
     for data_evento in datas_eventos:
-        
+        # if data_evento == Timestamp('2020-07-10 00:00:00'):
+        #     break
         mask_neg = (pd.to_datetime(df_neg['Data do Negócio'], dayfirst=True) >= data_inicio) & \
                    (pd.to_datetime(df_neg['Data do Negócio'], dayfirst=True) < data_evento)
         neg_periodo = df_neg[mask_neg]
@@ -271,49 +283,73 @@ def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
         # PASSO B: Processar Eventos do Dia (Fiel às suas fórmulas)
         eventos_dia = fila_eventos[fila_eventos['Data_DT'] == data_evento]
         
-        for _, ev in eventos_dia.iterrows():
+        if eventos_dia.empty:
+            eventos_dia = fila_eventos_neg[fila_eventos_neg['Data_DT'] == data_evento]
+            for _, ev in eventos_dia.iterrows():
+                # break
+                ticker_original = ev['Ticker']
+                tickers_existentes = set(consolidado['Ticker'])
+                ticker_alvo = resolver_ticker_mae(ticker_original, tickers_existentes)
+                # Se o ticker_alvo (pai ou ele mesmo) não existe, criamos
+                if ticker_alvo not in consolidado['Ticker'].values:
+                    nova_linha = pd.DataFrame([{c: 0 for c in consolidado.columns}])
+                    nova_linha['Ticker'] = ticker_alvo
+                    nova_linha['Ticker Raiz'] = raiz_ticker(ticker_alvo)
+                    consolidado = pd.concat([consolidado, nova_linha], ignore_index=True)
 
-            ticker_original = ev['Ticker']
-            tickers_existentes = set(consolidado['Ticker'])
-            ticker_alvo = resolver_ticker_mae(ticker_original, tickers_existentes)
+                idx = consolidado[consolidado['Ticker'] == ticker_alvo].index[0]
+                preco_medio_antes_da_venda=consolidacao_final(consolidado,tickers_afetados_incorporacao).query('Ticker == @ticker_alvo')['Preço Médio Ajustado'].values[0]
+                # print(f"Preço médio antes da venda: {preco_medio_antes_da_venda}")
+                if ev['Tipo de Movimentação'] == 'Venda':
+                    investido = ev['Quantidade'] * preco_medio_antes_da_venda
+                    consolidado.at[idx, 'Total Investido'] -= investido
+        else:
+            for _, ev in eventos_dia.iterrows():
+                
+                ticker_original = ev['Ticker']
+                tickers_existentes = set(consolidado['Ticker'])
+                ticker_alvo = resolver_ticker_mae(ticker_original, tickers_existentes)
+                
+                # Se o ticker_alvo (pai ou ele mesmo) não existe, criamos
+                if ticker_alvo not in consolidado['Ticker'].values:
+                    nova_linha = pd.DataFrame([{c: 0 for c in consolidado.columns}])
+                    nova_linha['Ticker'] = ticker_alvo
+                    nova_linha['Ticker Raiz'] = raiz_ticker(ticker_alvo)
+                    consolidado = pd.concat([consolidado, nova_linha], ignore_index=True)
 
-            # Se o ticker_alvo (pai ou ele mesmo) não existe, criamos
-            if ticker_alvo not in consolidado['Ticker'].values:
-                nova_linha = pd.DataFrame([{c: 0 for c in consolidado.columns}])
-                nova_linha['Ticker'] = ticker_alvo
-                nova_linha['Ticker Raiz'] = raiz_ticker(ticker_alvo)
-                consolidado = pd.concat([consolidado, nova_linha], ignore_index=True)
+                idx = consolidado[consolidado['Ticker'] == ticker_alvo].index[0]
 
-            idx = consolidado[consolidado['Ticker'] == ticker_alvo].index[0]
+                # --- Aplicação das Fórmulas ---
+                if ev['Movimentação'] == 'Desdobro':
+                    consolidado.at[idx, 'Quantidade_Desdobro'] += ev['Quantidade']
+                    # consolidado.at[idx, 'Qtd Compra'] += ev['Quantidade']
 
-            # --- Aplicação das Fórmulas ---
-            if ev['Movimentação'] == 'Desdobro':
-                consolidado.at[idx, 'Quantidade_Desdobro'] += ev['Quantidade']
-                # consolidado.at[idx, 'Qtd Compra'] += ev['Quantidade']
+                elif ev['Movimentação'] == 'Direitos de Subscrição - Exercido':
+                    qty = ev['Quantidade']
+                    qty = 0.0 if math.isnan(qty) else qty
+                    pcy = ev['Preço unitário']
+                    pcy = 0.0 if math.isnan(pcy) else pcy
+                    investido = qty * pcy
+                    consolidado.at[idx, 'Qtd_subscr'] += qty
+                    consolidado.at[idx, 'Total Investido'] += investido # Soma ao custo histórico
+                    # consolidado.at[idx, 'Qtd Compra'] += ev['Quantidade']
 
-            elif ev['Movimentação'] == 'Direitos de Subscrição - Exercido':
-                investido = ev['Quantidade'] * ev['Preço unitário']
-                consolidado.at[idx, 'Qtd_subscr'] += ev['Quantidade']
-                consolidado.at[idx, 'Total Investido'] += investido # Soma ao custo histórico
-                # consolidado.at[idx, 'Qtd Compra'] += ev['Quantidade']
-
-            elif ev['Movimentação'] == 'Bonificação em Ativos':
-                qtd_bonus = np.floor(ev['Quantidade'])
-                # investido_b = qtd_bonus * ev['Preço unitário'] # Custo atribuído pela empresa
-                consolidado.at[idx, 'Qtd Bonus'] += qtd_bonus
-                # consolidado.at[idx, 'Total Investido'] += investido_b # ISSO É IMPORTANTE
-                # consolidado.at[idx, 'Qtd Compra'] += qtd_bonus
-            elif ev['Movimentação'] == 'Incorporação':
-                res_inc = incorporacao(consolidado, df_mov, cnpj_b3)
-                tickers_afetados_incorporacao = res_inc[0] # Pega a lista de tickers "mortos"
-                ticker_sucessor = res_inc[1]
-                custo_total_acumulado = res_inc[2]
-                qtd_incorporada_b3 = res_inc[3]
-                # tickers_afetados_incorporacao,ticker_sucessor, custo_total_acumulado,qtd_incorporada_b3=incorporacao(consolidado, df_mov, cnpj_b3)
-                idx_sucessor = consolidado[consolidado['Ticker'] == ticker_sucessor].index[0]
-                consolidado.at[idx_sucessor, 'Qtd incorporada'] += qtd_incorporada_b3
-                consolidado.at[idx_sucessor, 'Total Investido'] += custo_total_acumulado
-
+                elif ev['Movimentação'] == 'Bonificação em Ativos':
+                    qtd_bonus = np.floor(ev['Quantidade'])
+                    # investido_b = qtd_bonus * ev['Preço unitário'] # Custo atribuído pela empresa
+                    consolidado.at[idx, 'Qtd Bonus'] += qtd_bonus
+                    # consolidado.at[idx, 'Total Investido'] += investido_b # ISSO É IMPORTANTE
+                    # consolidado.at[idx, 'Qtd Compra'] += qtd_bonus
+                elif ev['Movimentação'] == 'Incorporação':
+                    res_inc = incorporacao(consolidado, df_mov, cnpj_b3)
+                    tickers_afetados_incorporacao = res_inc[0] # Pega a lista de tickers "mortos"
+                    ticker_sucessor = res_inc[1]
+                    custo_total_acumulado = res_inc[2]
+                    qtd_incorporada_b3 = res_inc[3]
+                    # tickers_afetados_incorporacao,ticker_sucessor, custo_total_acumulado,qtd_incorporada_b3=incorporacao(consolidado, df_mov, cnpj_b3)
+                    idx_sucessor = consolidado[consolidado['Ticker'] == ticker_sucessor].index[0]
+                    consolidado.at[idx_sucessor, 'Qtd incorporada'] += qtd_incorporada_b3
+                    consolidado.at[idx_sucessor, 'Total Investido'] += custo_total_acumulado
 
 
         snapshot = consolidado.copy()
@@ -333,10 +369,10 @@ def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
     
     if not neg_finais.empty:
         consolidado = novo_consolidar_carteira(neg_finais, base_inicial=consolidado)
-
+        
     # PASSO EXTRA: Rendimentos (Fora do loop de custódia pois não alteram PM)
     consolidado = aplicar_rendimentos_finais(consolidado, df_mov)
-
+    
     # Adicionamos o estado final (Hoje) ao histórico
     final_snap = consolidado.copy()
     final_snap['Snapshot_Data'] = pd.Timestamp.now()
@@ -784,6 +820,7 @@ def calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,ticke
     df_lucros_completo = pd.DataFrame(columns=["Data do Negócio", "Ticker", "lucro", "tipo venda", "Preço Médio Ajustado"])
 
     historico_lucros = []
+    historico_preco_medio_venda= []
     # Loop principal
     for data_final_mes in periodo_analise:
         # if data_final_mes == periodo_analise[12]:
@@ -913,6 +950,7 @@ def calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,ticke
         # Selecionar apenas as colunas que você quer consolidar
         df_lucro = df_lucro[["Data do Negócio", "Ticker", "lucro", "tipo venda",'Preço Médio Ajustado']]
         # Guardar no histórico
+        historico_preco_medio_venda.append(df_carteira_atual)
         historico_lucros.append(df_lucro)
         # Concatena tudo no final
         df_lucros_completo = pd.concat(historico_lucros, ignore_index=True)
@@ -1048,9 +1086,6 @@ def resolver_ticker_mae(ticker_sub, tickers_consolidado):
     if sufixo == '2' and f'{raiz}4' in tickers_consolidado:
         return f'{raiz}4'
 
-    # Fallback para UNIT
-    if f'{raiz}11' in tickers_consolidado:
-        return f'{raiz}11'
 
     # Último fallback: retorna o próprio
     return ticker_sub
@@ -1073,7 +1108,7 @@ def historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo):
     # ---------- 3) Remover movimentações específicas em df_mov ----------
     # Remove "Empréstimo" e "Transferência - Liquidação"
     df_mov_f['Movimentação'] = df_mov_f['Movimentação'].astype(str).str.strip()
-    tipos_incluir = {'Compra','Bonificação em Ativos','Cisão0','Desdobro','Direitos de Subscrição - Exercido'}
+    tipos_incluir = {'Compra','Bonificação em Ativos','Cisão','Desdobro','Direitos de Subscrição - Exercido'}
     df_mov_f = df_mov_f[df_mov_f['Movimentação'].isin(tipos_incluir)].copy()
 
     # ---------- 4) Preparar cutoffs com base em 'venda total' ----------
@@ -1337,7 +1372,6 @@ def _gerar_carteira_cache():
 
     df_mov, cnpj_b3,df_subscricao= carregar_dados()
     df_mov= preparar_dados(df_mov,df_subscricao)
-
     df_neg = classificar_movimentacoes_v7(df_mov)
 
     tickers_afetados_incorporacao,df_carteira_final_historico = processar_fluxo_historico(df_neg,df_mov,cnpj_b3,ano_fiscal)
@@ -1346,28 +1380,6 @@ def _gerar_carteira_cache():
     # ---- Cálculos resumidos ----
     df_lucros_novo = calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao)
     # df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento,cnpj_b3)
-    df_lucros_novo['Data do Negócio'] = pd.to_datetime(df_lucros_novo['Data do Negócio'])
-
-    # 2. Criar pivôs para encontrar a última data de cada tipo de venda por Ticker
-    # Usamos 'max' para pegar a data mais recente
-    ultimas_vendas = df_lucros_novo.groupby(['Ticker', 'tipo venda'])['Data do Negócio'].max().unstack()
-
-    # O unstack() vai criar colunas 'venda parcial' e 'venda total'
-    # Vamos preencher valores nulos (caso um ticker nunca tenha tido um dos tipos) com uma data muito antiga
-    ultimas_vendas = ultimas_vendas.fillna(pd.Timestamp('1900-01-01'))
-
-    # 3. Filtrar: A última parcial deve ser depois da última total 
-    # (ou apenas existir parcial e nenhuma total)
-    tickers_filtrados = ultimas_vendas[
-        ultimas_vendas['venda parcial'] > ultimas_vendas['venda total']
-    ].index
-
-    # Garantimos que os tickers_filtrados sejam uma lista ou conjunto para a busca
-    lista_alvo = list(tickers_filtrados)
-
-    # Aplicamos a lógica: se o Ticker está na lista, 
-    # Total Investido = Total Investido - Total Vendido
-    df_carteira_final.loc[df_carteira_final['Ticker'].isin(lista_alvo), 'Total Investido'] -= df_carteira_final['Total Vendido']
     # desdobros, subscricoes, subscricoes_original, bonus, bonus_original, leilao, leilao_original = processar_eventos(df_mov)
     # ajuste_grupamento = aplicar_grupamentos(df_mov, df_neg, desdobros, subscricoes, bonus, leilao, cnpj_b3)
     # df = consolidar_carteira(df_neg, desdobros, subscricoes, bonus, leilao)
