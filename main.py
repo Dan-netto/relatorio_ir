@@ -1071,6 +1071,14 @@ def filtra_pos_venda_total(df, data_col,cutoff_por_ticker):
     out = out.loc[mask].drop(columns=['cutoff'])
     return out
 
+def filtra_pre_venda_total(df, data_col,cutoff_por_ticker):
+    out = df.merge(cutoff_por_ticker.rename('cutoff'),
+                left_on='Ticker', right_index=True, how='left')
+    # Mantém linhas sem cutoff (NaT) OU com data < cutoff
+    mask = out['cutoff'].isna() | (out[data_col] <= out['cutoff'])
+    out = out.loc[mask].drop(columns=['cutoff'])
+    return out
+
 def resolver_ticker_mae(ticker_sub, tickers_consolidado):
     """
     ticker_sub: str  -> ex: 'ITSA1', 'ITSA2'
@@ -1090,6 +1098,89 @@ def resolver_ticker_mae(ticker_sub, tickers_consolidado):
     # Último fallback: retorna o próprio
     return ticker_sub
 
+def historico_vendas(df_vendas,df_neg,df_mov,df_lucros_novo):
+    tickers_atuais=df_vendas['Ticker']
+    tickers_set = pd.Index([str(t).strip().upper() for t in tickers_atuais])
+    # Converte datas (usando dayfirst=True por padrão BR)
+    df_neg['Data do Negócio'] = pd.to_datetime(df_neg['Data do Negócio'], errors='coerce', dayfirst=True)
+    df_mov['Data'] = pd.to_datetime(df_mov['Data'], errors='coerce', dayfirst=True)
+
+    df_mov['Ticker'] = df_mov['Ticker'].apply(
+        lambda x: resolver_ticker_mae(x, tickers_set)
+    )
+
+    # ---------- 2) Filtro inicial por tickers ----------
+    df_neg_f = df_neg[df_neg['Ticker'].isin(tickers_set)].copy()
+    df_mov_f = df_mov[df_mov['Ticker'].isin(tickers_set)].copy()
+
+    # ---------- 3) Remover movimentações específicas em df_mov ----------
+    # Remove "Empréstimo" e "Transferência - Liquidação"
+    df_mov_f['Movimentação'] = df_mov_f['Movimentação'].astype(str).str.strip()
+    tipos_incluir = {'Bonificação em Ativos','Cisão','Desdobro','Direitos de Subscrição - Exercido'}
+    # tipos_excluir_neg = {'Venda'}
+    df_mov_f = df_mov_f[df_mov_f['Movimentação'].isin(tipos_incluir)].copy()
+    # df_neg_f = df_neg_f[~df_neg_f['Tipo de Movimentação'].isin(tipos_excluir_neg)].copy()
+
+    # ---------- 4) Preparar cutoffs com base em 'venda total' ----------
+    # Mantém apenas vendas totais por ticker presentes em tickers_atual
+    mask_venda_total = df_lucros_novo['tipo venda'].astype(str).str.strip().str.lower().isin(['venda total', 'venda parcial'])
+    df_lucros_vt = df_lucros_novo[mask_venda_total & df_lucros_novo['Ticker'].isin(tickers_set)].copy()
+
+    # Para cada Ticker, pega a data MAIS RECENTE de 'venda total'
+    cutoff_por_ticker = df_lucros_vt.groupby('Ticker', as_index=True)['Data do Negócio'].max()
+
+    df_neg_f = filtra_pre_venda_total(df_neg_f, 'Data do Negócio',cutoff_por_ticker)
+    df_mov_f = filtra_pre_venda_total(df_mov_f, 'Data',cutoff_por_ticker)
+
+    # ---------- 5) Renomear colunas no df_mov e selecionar colunas ----------
+    df_mov_f = df_mov_f.rename(columns={'Preço unitário': 'Preço',
+                                        'Valor da Operação':'Valor',
+                                          'Movimentação':'Tipo de Movimentação',
+                                          'Data':'Data do Negócio'})
+
+    # Seleção final de colunas:
+    # Observação: mantenho "Ticker" para você identificar a qual ativo cada linha pertence.
+    # Se quiser EXCLUSIVAMENTE as colunas solicitadas, basta remover 'Ticker' das listas abaixo.
+    cols_neg_final = [c for c in ['Data do Negócio','Ticker','Tipo de Movimentação','Quantidade', 'Preço', 'Valor'] if c in df_neg_f.columns]
+    cols_mov_final = [c for c in ['Data do Negócio','Ticker','Tipo de Movimentação','Quantidade', 'Preço', 'Valor','Link_PDF'] if c in df_mov_f.columns]
+   
+
+    df_neg_final = df_neg_f.loc[:, cols_neg_final].fillna(0.0).copy()
+    df_mov_final = df_mov_f.loc[:, cols_mov_final].copy()
+
+    # 2. Identificamos apenas as colunas numéricas (int e float)
+    cols_numericas = df_mov_final.select_dtypes(include=['number']).columns
+
+    # 3. Aplicamos o fillna apenas nessas colunas
+    df_mov_final[cols_numericas] = df_mov_final[cols_numericas].fillna(0.0)
+
+
+    # 1) Colunas alvo e garantia de existência
+    cols_alvo_neg = ['Data do Negócio', 'Ticker', 'Tipo de Movimentação', 'Quantidade', 'Preço', 'Valor']
+    cols_alvo_mov= ['Data do Negócio', 'Ticker', 'Tipo de Movimentação', 'Quantidade', 'Preço', 'Valor','Link_PDF']
+
+    
+    neg_hist = padroniza(df_neg_final, origem='Negociação', cols_alvo=cols_alvo_neg)
+    mov_hist = padroniza(df_mov_final, origem='Movimentação', cols_alvo=cols_alvo_mov)
+
+    # 2) Concatena
+    df_hist = pd.concat([neg_hist, mov_hist], ignore_index=True)
+
+    # 3) Remove linhas sem data (se houver)
+    df_hist = df_hist[~df_hist['Data do Negócio'].isna()].copy()
+
+    # 4) Ordenação: por Ticker, Data, e desempate por Origem (opcional)
+    #    Se preferir priorizar Negociação antes de Movimentação no mesmo dia:
+    categoria_origem = pd.CategoricalDtype(categories=['Negociação', 'Movimentação'], ordered=True)
+    df_hist['Origem'] = df_hist['Origem'].astype(categoria_origem)
+
+    df_hist = df_hist.sort_values(by=['Ticker', 'Data do Negócio', 'Origem'], ascending=[True, True, True]).reset_index(drop=True)
+
+    # 5) (Opcional) Se quiser uma coluna "Sequência" por Ticker
+    df_hist['Sequência'] = df_hist.groupby('Ticker').cumcount() + 1
+    
+    return(df_hist)
+
 def historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo):
     tickers_atuais=df_ir['Ticker']
     tickers_set = pd.Index([str(t).strip().upper() for t in tickers_atuais])
@@ -1108,7 +1199,7 @@ def historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo):
     # ---------- 3) Remover movimentações específicas em df_mov ----------
     # Remove "Empréstimo" e "Transferência - Liquidação"
     df_mov_f['Movimentação'] = df_mov_f['Movimentação'].astype(str).str.strip()
-    tipos_incluir = {'Compra','Bonificação em Ativos','Cisão','Desdobro','Direitos de Subscrição - Exercido'}
+    tipos_incluir = {'Bonificação em Ativos','Cisão','Desdobro','Direitos de Subscrição - Exercido'}
     df_mov_f = df_mov_f[df_mov_f['Movimentação'].isin(tipos_incluir)].copy()
 
     # ---------- 4) Preparar cutoffs com base em 'venda total' ----------
@@ -1396,12 +1487,13 @@ def _gerar_carteira_cache():
     df = df_carteira.iloc[:-1].merge(proventos_pivot_ir, on="Ticker", how="left")
     df_ir=df[df['Qtd Final'] > 0][['Ticker','Qtd Final','Total Investido','Preço Médio Ajustado']].copy()
 
-    df = df[['Ticker','Dividendo','Juros Sobre Capital Próprio','Reembolso','Rendimento_fii','Rendimento_acoes']].fillna(0)
+    df_proventos = df[['Ticker','Dividendo','Juros Sobre Capital Próprio','Reembolso','Rendimento_fii','Rendimento_acoes']].fillna(0)
 
     df_historico_negociacoes=historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo)
     df_historico_negociacoes['Link_PDF'] = df_historico_negociacoes['Link_PDF'].fillna('-')
     df_historico_proventos=historico_proventos(df_ir,df_mov,df_lucros_novo,ano_fiscal)
-
+    df_vendas=df_carteira[df_carteira['Qtd Final'] == 0]
+    df_historico_vendas=historico_vendas(df_vendas,df_neg,df_mov,df_lucros_novo)
         
 
     # ---- Ajuste de nomes ----
@@ -1415,7 +1507,7 @@ def _gerar_carteira_cache():
     # })
     
     
-    json_final = gerar_json_ir(df_ir, df, cnpj_b3, df_lucros_novo, df_historico_negociacoes, df_historico_proventos, ano_fiscal)
+    json_final = gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros_novo, df_historico_negociacoes, df_historico_proventos, ano_fiscal)
     return json_final
 
     # ---- Retorno padronizado ----
