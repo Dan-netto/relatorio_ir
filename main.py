@@ -1309,7 +1309,7 @@ def agrupar_emprestimos_proximos(df_emp):
             
             return df_agrupado.drop(columns=['grupo_id'])
 
-def gerar_json_ir(df_ir, df, cnpj_b3, df_lucros, df_historico_negociacoes, df_historico_proventos,df_historico_vendas, ano_fiscal):
+def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociacoes, df_historico_proventos,df_historico_vendas, ano_fiscal):
     """
     df_ir: Contém ['Ticker', 'Qtd Final', 'Total Investido', 'Preço Médio Ajustado']
     df: Contém os totais agregados ['Ticker', 'dividendos', 'juros_sobre_capital_proprio', 'Reembolso', 'Rendimento_fii', 'Rendimento_acoes']
@@ -1317,7 +1317,7 @@ def gerar_json_ir(df_ir, df, cnpj_b3, df_lucros, df_historico_negociacoes, df_hi
     
     # --- 1. PREPARAÇÃO DA CARTEIRA PRINCIPAL ---
     # Unificamos dados de custódia, totais de proventos e informações de CNPJ
-    df_consolidado = pd.merge(df_ir, df, on='Ticker', how='left')
+    df_consolidado = pd.merge(df_ir, df_proventos, on='Ticker', how='left')
     df_consolidado = pd.merge(df_consolidado, cnpj_b3, on='Ticker', how='left')
     
     df_consolidado['CNPJ'] = df_consolidado['CNPJ'].fillna("00.000.000/0000-00")
@@ -1356,8 +1356,8 @@ def gerar_json_ir(df_ir, df, cnpj_b3, df_lucros, df_historico_negociacoes, df_hi
                 "preco_medio_ajustado": float(row['Preço Médio Ajustado'])
             },
             "totais_proventos": {
-                "dividendos": float(row.get('dividendos', 0)),
-                "jcp": float(row.get('juros_sobre_capital_proprio', 0)),
+                "dividendos": float(row.get('Dividendo', 0)),
+                "jcp": float(row.get('Juros Sobre Capital Próprio', 0)),
                 "reembolso": float(row.get('Reembolso', 0)),
                 "rendimento_fii": float(row.get('Rendimento_fii', 0)),
                 "rendimento_acoes": float(row.get('Rendimento_acoes', 0))
