@@ -61,7 +61,7 @@ def raiz_ticker(ticker):
     return str(ticker).strip()[:4].upper()
 
 def carregar_dados():
-        df_mov = pd.read_sql("SELECT * FROM ldinvest_movimentacao_21092025", con=engine)
+        df_mov = pd.read_sql("SELECT * FROM movimentacao_2026_02_12", con=engine)
         # df_neg = pd.read_sql("SELECT * FROM ldinvest_negociacao_21092025", con=engine)
         cnpj_b3 = pd.read_sql("SELECT * FROM cnpj_b3_total", con=engine)
         df_subscricao = pd.read_sql("SELECT * FROM base_precos_subscricao_total", con=engine)
@@ -682,60 +682,6 @@ def cisao(df_carteira,df_mov):
    
 
     return(df_carteira)
-    
-def gerar_json_ir(df, cnpj_b3, df_lucros,ano_fiscal):
-    """
-    Consolida os dados para o Relatório de IR.
-    df_carteira_filtrada: Contém quantidade, preco_medio, total_investido, Dividendo, Juros Sobre Capital Próprio
-    cnpj_b3: Tabela de de-para Ticker -> CNPJ e Razão Social
-    df_lucros: Histórico de vendas com coluna 'lucro' e 'Data do Negócio'
-    """
-
-    # --- 1. PREPARAÇÃO DA CARTEIRA (Bens e Direitos + Proventos) ---
-    
-    # Merge com a tabela de CNPJs para enriquecer os dados
-    df_ir = pd.merge(df, cnpj_b3, on='Ticker', how='left')
-    
-    # Tratamento de valores nulos e renomeação para o padrão do Front
-    df_ir['CNPJ'] = df_ir['CNPJ'].fillna("CNPJ não encontrado")
-    df_ir['Razão Social'] = df_ir['Razão Social'].fillna("Razão Social não encontrada")
-    
-    # Selecionamos e renomeamos apenas as colunas que o front vai usar
-    carteira_ir = df_ir.rename(columns={
-        'Razão Social': 'Razao_Social'
-    })[['Ticker', 'CNPJ', 'Razao_Social', 'quantidade', 'preco_medio', 'total_investido', 'dividendos', 'juros_sobre_capital_proprio']]
-    
-    # Converter para lista de dicionários
-    lista_carteira = carteira_ir.to_dict(orient='records')
-
-    # --- 2. PREPARAÇÃO DOS LUCROS MENSAIS (Renda Variável) ---
-    
-    # Garantir que a data está no formato correto e filtrar o ano anterior
-    df_lucros['Data do Negócio'] = pd.to_datetime(df_lucros['Data do Negócio'])
-    df_lucros_ir = df_lucros[df_lucros['Data do Negócio'].dt.year == int(ano_fiscal)].copy()
-    
-    # Criar um esqueleto dos 12 meses para garantir que o JSON tenha todos, mesmo com lucro zero
-    meses_nomes = {
-        1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril", 5: "Maio", 6: "Junho",
-        7: "Julho", 8: "Agosto", 9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro"
-    }
-    
-    lucros_por_mes = df_lucros_ir.groupby(df_lucros_ir['Data do Negócio'].dt.month)['lucro'].sum().to_dict()
-    
-    lista_lucros_mensais = []
-    for m in range(1, 13):
-        lista_lucros_mensais.append({
-            "mes": m,
-            "mes_nome": meses_nomes[m],
-            "lucro": float(lucros_por_mes.get(m, 0.0))
-        })
-
-    # --- 3. MONTAGEM DO JSON FINAL ---
-    return {
-        "ano_referencia": ano_fiscal,
-        "carteira_ir": lista_carteira,
-        "lucros_mensais": lista_lucros_mensais
-    }
 
 def calcular_proventos_ir(df_mov,ano_fiscal):
     # 1. Preparação das datas
@@ -1363,7 +1309,7 @@ def agrupar_emprestimos_proximos(df_emp):
             
             return df_agrupado.drop(columns=['grupo_id'])
 
-def gerar_json_ir(df_ir, df, cnpj_b3, df_lucros, df_historico_negociacoes, df_historico_proventos, ano_fiscal):
+def gerar_json_ir(df_ir, df, cnpj_b3, df_lucros, df_historico_negociacoes, df_historico_proventos,df_historico_vendas, ano_fiscal):
     """
     df_ir: Contém ['Ticker', 'Qtd Final', 'Total Investido', 'Preço Médio Ajustado']
     df: Contém os totais agregados ['Ticker', 'dividendos', 'juros_sobre_capital_proprio', 'Reembolso', 'Rendimento_fii', 'Rendimento_acoes']
@@ -1429,12 +1375,46 @@ def gerar_json_ir(df_ir, df, cnpj_b3, df_lucros, df_historico_negociacoes, df_hi
     meses_nomes = {1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun", 
                    7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez"}
     
-    lucros_por_mes = df_lucros_ir.groupby(df_lucros_ir['Data do Negócio'].dt.month)['lucro'].sum().to_dict()
-    
-    lista_lucros_mensais = [
-        {"mes": m, "mes_nome": meses_nomes[m], "lucro": float(lucros_por_mes.get(m, 0.0))}
-        for m in range(1, 13)
-    ]
+    lista_lucros_mensais = []
+
+    for m in range(1, 13):
+        # Filtra lucros do mês
+        lucros_mes = df_lucros_ir[df_lucros_ir['Data do Negócio'].dt.month == m]
+        valor_total_lucro = clean_val(lucros_mes['lucro'].sum())
+        
+        detalhes_vendas_mes = []
+        
+        # Para cada ticker vendido no mês, buscamos o histórico que justifica o PM
+        for _, venda in lucros_mes.iterrows():
+            ticker_vendido = venda['Ticker']
+            data_venda = venda['Data do Negócio']
+            
+            # Filtra o histórico de eventos RELEVANTES (Compras/Eventos) até a data desta venda
+            # Usamos o df_historico_vendas que você mencionou
+            historico_venda = df_historico_vendas[
+                (df_historico_vendas['Ticker'] == ticker_vendido) & 
+                (pd.to_datetime(df_historico_vendas['Data do Negócio']) <= data_venda)
+            ].sort_values('Sequência').copy()
+            
+            # Seleciona apenas as colunas solicitadas
+            colunas_view = ['Data do Negócio', 'Ticker', 'Tipo de Movimentação', 'Quantidade', 'Preço', 'Valor']
+            historico_view = historico_venda[colunas_view].fillna(0)
+            historico_view['Data do Negócio'] = pd.to_datetime(historico_view['Data do Negócio']).dt.strftime('%d/%m/%Y')
+
+            detalhes_vendas_mes.append({
+                "ticker": ticker_vendido,
+                "data_venda": data_venda.strftime('%d/%m/%Y'),
+                "lucro_apurado": clean_val(venda['lucro']),
+                "tipo_venda": venda.get('tipo venda', 'venda'),
+                "drill_down_historico": historico_view.to_dict(orient='records')
+            })
+
+        lista_lucros_mensais.append({
+            "mes": m,
+            "mes_nome": meses_nomes[m],
+            "lucro_total": valor_total_lucro,
+            "vendas": detalhes_vendas_mes # Aqui está o novo drill down das vendas
+        })
 
     # --- 4. JSON FINAL ---
     return {
@@ -1443,6 +1423,10 @@ def gerar_json_ir(df_ir, df, cnpj_b3, df_lucros, df_historico_negociacoes, df_hi
         "carteira": lista_carteira_detalhada
     }
 
+def clean_val(val):
+        if pd.isna(val) or np.isinf(val):
+            return 0.0
+        return float(val)
 # 4. Nova Lógica de Verificação (Individual e Soma)
 
 # ---------------- ROTAS ----------------
@@ -1469,7 +1453,7 @@ def _gerar_carteira_cache():
     df_carteira_final=df_carteira_final_historico[-1]
 
     # ---- Cálculos resumidos ----
-    df_lucros_novo = calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao)
+    df_lucros = calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao)
     # df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento,cnpj_b3)
     # desdobros, subscricoes, subscricoes_original, bonus, bonus_original, leilao, leilao_original = processar_eventos(df_mov)
     # ajuste_grupamento = aplicar_grupamentos(df_mov, df_neg, desdobros, subscricoes, bonus, leilao, cnpj_b3)
@@ -1489,11 +1473,11 @@ def _gerar_carteira_cache():
 
     df_proventos = df[['Ticker','Dividendo','Juros Sobre Capital Próprio','Reembolso','Rendimento_fii','Rendimento_acoes']].fillna(0)
 
-    df_historico_negociacoes=historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo)
+    df_historico_negociacoes=historico_negociacoes(df_ir,df_neg,df_mov,df_lucros)
     df_historico_negociacoes['Link_PDF'] = df_historico_negociacoes['Link_PDF'].fillna('-')
-    df_historico_proventos=historico_proventos(df_ir,df_mov,df_lucros_novo,ano_fiscal)
+    df_historico_proventos=historico_proventos(df_ir,df_mov,df_lucros,ano_fiscal)
     df_vendas=df_carteira[df_carteira['Qtd Final'] == 0]
-    df_historico_vendas=historico_vendas(df_vendas,df_neg,df_mov,df_lucros_novo)
+    df_historico_vendas=historico_vendas(df_vendas,df_neg,df_mov,df_lucros)
         
 
     # ---- Ajuste de nomes ----
@@ -1507,7 +1491,7 @@ def _gerar_carteira_cache():
     # })
     
     
-    json_final = gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros_novo, df_historico_negociacoes, df_historico_proventos, ano_fiscal)
+    json_final = gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociacoes, df_historico_proventos,df_historico_vendas, ano_fiscal)
     return json_final
 
     # ---- Retorno padronizado ----
