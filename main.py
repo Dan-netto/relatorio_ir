@@ -65,6 +65,23 @@ def carregar_dados():
         # df_neg = pd.read_sql("SELECT * FROM ldinvest_negociacao_21092025", con=engine)
         cnpj_b3 = pd.read_sql("SELECT * FROM cnpj_b3_total", con=engine)
         df_subscricao = pd.read_sql("SELECT * FROM base_precos_subscricao_total", con=engine)
+        cnpj_complemento=pd.read_sql("SELECT * FROM cnpj_b3", con=engine)
+        cnpj_complemento['Ticker'] = (
+        cnpj_complemento['Ticker']
+        .astype(str)
+        .str.strip()
+        .str.split(r'\s+')
+        )
+
+        # transforma cada item da lista em uma linha
+        cnpj_complemento = cnpj_complemento.explode('Ticker', ignore_index=True)
+
+        # limpa casos vazios (se existir)
+        cnpj_complemento['Ticker'] = cnpj_complemento['Ticker'].str.strip()
+        cnpj_complemento = cnpj_complemento[cnpj_complemento['Ticker'] != '']
+
+        cnpj_b3=pd.concat([cnpj_b3, cnpj_complemento], ignore_index=True).drop_duplicates(subset=['CNPJ', 'Ticker'])
+
         return df_mov, cnpj_b3, df_subscricao
 
 def preparar_dados(df_mov,df_subscricao):
@@ -1208,80 +1225,61 @@ def historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo):
     
     return(df_hist)
 
-def historico_proventos(df_ir,df_mov,df_lucros_novo,ano_fiscal):
-
-    tickers_atuais=df_ir['Ticker']
-    tickers_set = pd.Index([str(t).strip().upper() for t in tickers_atuais])
-
+def historico_proventos(df_ir, df_mov, ano_fiscal):
+    # 1) Preparação dos Tickers
+    tickers_atuais = df_ir['Ticker']
+    tickers_set = set([str(t).strip().upper() for t in tickers_atuais])
     ano = int(ano_fiscal)
 
-    # 2) Converte a coluna 'Data' para datetime (robusto a formatos) e com dayfirst=True
+    # 2) Limpeza e Filtro de Datas
     df_mov = df_mov.copy()
     df_mov['Data'] = pd.to_datetime(df_mov['Data'], errors='coerce', dayfirst=True)
-
-    # 3) Define limites do ano fiscal (início e fim INCLUSIVOS)
+    
     inicio = pd.Timestamp(year=ano, month=1, day=1)
     fim = pd.Timestamp(year=ano, month=12, day=31, hour=23, minute=59, second=59)
-
-    # 4) Aplica o filtro
-    mask = df_mov['Data'].between(inicio, fim, inclusive='both')
-    # Converte datas (usando dayfirst=True por padrão BR)
-    df_mov['Data'] = pd.to_datetime(df_mov['Data'], errors='coerce', dayfirst=True)
     
-    
+    # Filtra tickers e período
+    df_mov_f = df_mov[
+        (df_mov['Ticker'].isin(tickers_set)) & 
+        (df_mov['Data'].between(inicio, fim))
+    ].copy()
 
+    # 3) Categorização dos Proventos
+    # Mapeamento para separar o que é cada coisa
+    def categorizar_provento(mov):
+        mov = str(mov).strip()
+        if 'Dividendo' in mov:
+            return 'Dividendo'
+        elif 'Juros Sobre Capital Próprio' in mov or 'JCP' in mov:
+            return 'JCP'
+        elif 'Rendimento' in mov:
+            return 'Rendimento'
+        else:
+            return 'Outros'
 
-    # ---------- 2) Filtro inicial por tickers ----------
-    df_mov_f = df_mov[df_mov['Ticker'].isin(tickers_set)].copy()
+    df_mov_f['Categoria_IR'] = df_mov_f['Movimentação'].apply(categorizar_provento)
 
-    # ---------- 3) Remover movimentações específicas em df_mov ----------
-    # Remove "Empréstimo" e "Transferência - Liquidação"
-    df_mov_f['Movimentação'] = df_mov_f['Movimentação'].astype(str).str.strip()
-    tipos_excluir = {'Empréstimo', 'Transferência - Liquidação','Cisão','Grupamento','Transferência','Bonificação em Ativos','Atualização',
-                     'Fração em Ativos','Desdobro','Reembolso'}
-    df_mov_f = df_mov_f[~df_mov_f['Movimentação'].isin(tipos_excluir)].copy()
+    # 4) Filtrar apenas o que interessa (removemos compras, vendas e eventos de custódia)
+    tipos_validos = ['Dividendo', 'JCP', 'Rendimento']
+    df_mov_f = df_mov_f[df_mov_f['Categoria_IR'].isin(tipos_validos)].copy()
 
-    # ---------- 4) Preparar cutoffs com base em 'venda total' ----------
-    # Mantém apenas vendas totais por ticker presentes em tickers_atual
-    mask_venda_total = df_lucros_novo['tipo venda'].astype(str).str.strip().str.lower().eq('venda total')
-    df_lucros_vt = df_lucros_novo[mask_venda_total & df_lucros_novo['Ticker'].isin(tickers_set)].copy()
+    # 5) Padronização de Colunas
+    df_mov_f = df_mov_f.rename(columns={
+        'Preço unitário': 'Preço',
+        'Valor da Operação': 'Valor',
+        'Movimentação': 'Tipo de Movimentação',
+        'Data': 'Data do Negócio'
+    })
 
-    # Para cada Ticker, pega a data MAIS RECENTE de 'venda total'
-    cutoff_por_ticker = df_lucros_vt.groupby('Ticker', as_index=True)['Data do Negócio'].max()
+    # Seleção de colunas finais para o drill-down
+    cols_finais = ['Data do Negócio', 'Ticker', 'Tipo de Movimentação', 'Quantidade', 'Preço', 'Valor', 'Categoria_IR']
+    df_hist_prov = df_mov_f[cols_finais].fillna(0.0).copy()
 
-    df_mov_f = filtra_pos_venda_total(df_mov_f, 'Data',cutoff_por_ticker)
-
-    # ---------- 5) Renomear colunas no df_mov e selecionar colunas ----------
-    df_mov_f = df_mov_f.rename(columns={'Preço unitário': 'Preço',
-                                        'Valor da Operação':'Valor',
-                                          'Movimentação':'Tipo de Movimentação',
-                                          'Data':'Data do Negócio'})
-
-    # Seleção final de colunas:
-    # Observação: mantenho "Ticker" para você identificar a qual ativo cada linha pertence.
-    # Se quiser EXCLUSIVAMENTE as colunas solicitadas, basta remover 'Ticker' das listas abaixo.
-    cols_mov_final = [c for c in ['Data do Negócio','Ticker','Tipo de Movimentação','Quantidade', 'Preço', 'Valor'] if c in df_mov_f.columns]
-   
-    df_mov_final = df_mov_f.loc[:, cols_mov_final].fillna(0.0).copy()
-
-    # 1) Colunas alvo e garantia de existência
-    cols_alvo = ['Data do Negócio', 'Ticker', 'Tipo de Movimentação', 'Quantidade', 'Preço', 'Valor']
-
-    df_hist_prov = padroniza(df_mov_final, origem='Movimentação', cols_alvo=cols_alvo) 
-
-    # 3) Remove linhas sem data (se houver)
-    df_hist_prov = df_hist_prov[~df_hist_prov['Data do Negócio'].isna()].copy()
-
-    # 4) Ordenação: por Ticker, Data, e desempate por Origem (opcional)
-    #    Se preferir priorizar Negociação antes de Movimentação no mesmo dia:
-    categoria_origem = pd.CategoricalDtype(categories=['Negociação', 'Movimentação'], ordered=True)
-    df_hist_prov['Origem'] = df_hist_prov['Origem'].astype(categoria_origem)
-
-    df_hist_prov = df_hist_prov.sort_values(by=['Ticker', 'Data do Negócio', 'Origem'], ascending=[True, True, True]).reset_index(drop=True)
-
-    # 5) (Opcional) Se quiser uma coluna "Sequência" por Ticker
+    # 6) Ordenação e Sequência
+    df_hist_prov = df_hist_prov.sort_values(by=['Ticker', 'Data do Negócio']).reset_index(drop=True)
     df_hist_prov['Sequência'] = df_hist_prov.groupby('Ticker').cumcount() + 1
-    return(df_hist_prov)
+    
+    return df_hist_prov
 
 def agrupar_emprestimos_proximos(df_emp):
             df = df_emp.copy()
@@ -1324,27 +1322,25 @@ def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociac
     df_consolidado['Razão Social'] = df_consolidado['Razão Social'].fillna("Razão Social não encontrada")
 
     lista_carteira_detalhada = []
-
     # --- 2. LOOP PARA CRIAR O DRILL-DOWN POR TICKER ---
     for _, row in df_consolidado.iterrows():
         ticker = row['Ticker']
-        
         # Detalhes de Negociações (Explicação do Preço Médio)
         # Filtramos o histórico e ordenamos pela sequência
         neg_ticker = df_historico_negociacoes[df_historico_negociacoes['Ticker'] == ticker].sort_values('Sequência')
         detalhes_neg = neg_ticker.copy()
         detalhes_neg['Data do Negócio'] = detalhes_neg['Data do Negócio'].dt.strftime('%d/%m/%Y')
         
-        # Detalhes de Proventos (Explicação dos Dividendos Totais)
-        # Aqui filtramos apenas o que caiu no ano fiscal selecionado
-        prov_ticker = df_historico_proventos[
-            (df_historico_proventos['Ticker'] == ticker) & 
-            (pd.to_datetime(df_historico_proventos['Data do Negócio']).dt.year == int(ano_fiscal))
-        ].sort_values('Sequência')
-        
-        detalhes_prov = prov_ticker.copy()
-        detalhes_prov['Data do Negócio'] = pd.to_datetime(detalhes_prov['Data do Negócio']).dt.strftime('%d/%m/%Y')
+        # Dentro do loop de tickers na função gerar_json_ir:
 
+        prov_ticker = df_historico_proventos[df_historico_proventos['Ticker'] == ticker].copy()
+        prov_ticker['Data do Negócio'] = pd.to_datetime(prov_ticker['Data do Negócio']).dt.strftime('%d/%m/%Y')
+        
+        # Filtramos as listas de detalhes para o front-end
+        detalhes_dividendos = prov_ticker[prov_ticker['Categoria_IR'] == 'Dividendo'].to_dict(orient='records')
+        detalhes_jcp = prov_ticker[prov_ticker['Categoria_IR'] == 'JCP'].to_dict(orient='records')
+        detalhes_rendimentos = prov_ticker[prov_ticker['Categoria_IR'] == 'Rendimento'].to_dict(orient='records')
+        
         # Montagem do objeto do Ticker
         item_carteira = {
             "ticker": ticker,
@@ -1356,18 +1352,20 @@ def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociac
                 "preco_medio_ajustado": float(row['Preço Médio Ajustado'])
             },
             "totais_proventos": {
-                "dividendos": float(row.get('Dividendo', 0)),
-                "jcp": float(row.get('Juros Sobre Capital Próprio', 0)),
-                "reembolso": float(row.get('Reembolso', 0)),
-                "rendimento_fii": float(row.get('Rendimento_fii', 0)),
-                "rendimento_acoes": float(row.get('Rendimento_acoes', 0))
+                "dividendos": clean_val(row.get('Dividendo')),
+                "jcp": clean_val(row.get('Juros Sobre Capital Próprio')),
+                "reembolso": clean_val(row.get('Reembolso')),
+                "rendimento_fii": clean_val(row.get('Rendimento_fii')),
+                "rendimento_acoes": clean_val(row.get('Rendimento_acoes'))
             },
             "drill_down_negociacoes": detalhes_neg.to_dict(orient='records'),
-            "drill_down_proventos": detalhes_prov.to_dict(orient='records')
+            "drill_down_dividendos": detalhes_dividendos,
+            "drill_down_jcp": detalhes_jcp,
+            "drill_down_rendimentos": detalhes_rendimentos
         }
         
         lista_carteira_detalhada.append(item_carteira)
-
+        
     # --- 3. PREPARAÇÃO DOS LUCROS MENSAIS (Renda Variável) ---
     df_lucros['Data do Negócio'] = pd.to_datetime(df_lucros['Data do Negócio'])
     df_lucros_ir = df_lucros[df_lucros['Data do Negócio'].dt.year == int(ano_fiscal)].copy()
@@ -1475,7 +1473,7 @@ def _gerar_carteira_cache():
 
     df_historico_negociacoes=historico_negociacoes(df_ir,df_neg,df_mov,df_lucros)
     df_historico_negociacoes['Link_PDF'] = df_historico_negociacoes['Link_PDF'].fillna('-')
-    df_historico_proventos=historico_proventos(df_ir,df_mov,df_lucros,ano_fiscal)
+    df_historico_proventos=historico_proventos(df_ir,df_mov,ano_fiscal)
     df_vendas=df_carteira[df_carteira['Qtd Final'] == 0]
     df_historico_vendas=historico_vendas(df_vendas,df_neg,df_mov,df_lucros)
         
