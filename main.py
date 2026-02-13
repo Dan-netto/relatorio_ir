@@ -84,7 +84,7 @@ def carregar_dados():
 
         return df_mov, cnpj_b3, df_subscricao
 
-def preparar_dados(df_mov,df_subscricao):
+def preparar_dados(df_mov,df_subscricao,ano_fiscal):
     # for col in ['Preço', 'Valor', 'Quantidade']:
     #     df_neg[col] = limpar_valor(df_neg[col])
     for col in ['Preço unitário', 'Valor da Operação', 'Quantidade']:
@@ -146,6 +146,12 @@ def preparar_dados(df_mov,df_subscricao):
     ignore_index=True,
     sort=False
     )
+
+    data_fim = pd.to_datetime(f"{ano_fiscal}-12-31")
+    df_mov['Data'] = pd.to_datetime(df_mov['Data'], dayfirst=True)
+
+    # Now the filter is much cleaner
+    df_mov = df_mov[(df_mov['Data'] < data_fim)]
 
     return df_mov
 
@@ -1315,7 +1321,7 @@ def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociac
     
     # --- 1. PREPARAÇÃO DA CARTEIRA PRINCIPAL ---
     # Unificamos dados de custódia, totais de proventos e informações de CNPJ
-    df_consolidado = pd.merge(df_ir, df_proventos, on='Ticker', how='left')
+    df_consolidado = pd.merge(df_ir, df_proventos, on='Ticker', how='outer').fillna(0.0)
     df_consolidado = pd.merge(df_consolidado, cnpj_b3, on='Ticker', how='left')
     
     df_consolidado['CNPJ'] = df_consolidado['CNPJ'].fillna("00.000.000/0000-00")
@@ -1444,7 +1450,7 @@ def _gerar_carteira_cache():
     print("♻️  Recalculando carteira completa...")
 
     df_mov, cnpj_b3,df_subscricao= carregar_dados()
-    df_mov= preparar_dados(df_mov,df_subscricao)
+    df_mov= preparar_dados(df_mov,df_subscricao,ano_fiscal)
     df_neg = classificar_movimentacoes_v7(df_mov)
 
     tickers_afetados_incorporacao,df_carteira_final_historico = processar_fluxo_historico(df_neg,df_mov,cnpj_b3,ano_fiscal)
