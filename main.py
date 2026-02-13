@@ -1231,9 +1231,9 @@ def historico_negociacoes(df_ir,df_neg,df_mov,df_lucros_novo):
     
     return(df_hist)
 
-def historico_proventos(df_ir, df_mov, ano_fiscal):
+def historico_proventos(df_proventos, df_mov, ano_fiscal):
     # 1) Preparação dos Tickers
-    tickers_atuais = df_ir['Ticker']
+    tickers_atuais = df_proventos['Ticker']
     tickers_set = set([str(t).strip().upper() for t in tickers_atuais])
     ano = int(ano_fiscal)
 
@@ -1260,13 +1260,15 @@ def historico_proventos(df_ir, df_mov, ano_fiscal):
             return 'JCP'
         elif 'Rendimento' in mov:
             return 'Rendimento'
+        elif 'Reembolso' in mov:
+            return 'Reembolso'
         else:
             return 'Outros'
 
     df_mov_f['Categoria_IR'] = df_mov_f['Movimentação'].apply(categorizar_provento)
 
     # 4) Filtrar apenas o que interessa (removemos compras, vendas e eventos de custódia)
-    tipos_validos = ['Dividendo', 'JCP', 'Rendimento']
+    tipos_validos = ['Dividendo', 'JCP', 'Rendimento','Reembolso']
     df_mov_f = df_mov_f[df_mov_f['Categoria_IR'].isin(tipos_validos)].copy()
 
     # 5) Padronização de Colunas
@@ -1318,10 +1320,14 @@ def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociac
     df_ir: Contém ['Ticker', 'Qtd Final', 'Total Investido', 'Preço Médio Ajustado']
     df: Contém os totais agregados ['Ticker', 'dividendos', 'juros_sobre_capital_proprio', 'Reembolso', 'Rendimento_fii', 'Rendimento_acoes']
     """
-    
+    tickers_no_ir = df_ir['Ticker'].unique()
+    tickers_com_proventos = df_historico_proventos['Ticker'].unique()
+    todos_tickers = pd.Series(np.union1d(tickers_no_ir, tickers_com_proventos), name='Ticker')
+    df_base = pd.DataFrame(todos_tickers)
     # --- 1. PREPARAÇÃO DA CARTEIRA PRINCIPAL ---
     # Unificamos dados de custódia, totais de proventos e informações de CNPJ
-    df_consolidado = pd.merge(df_ir, df_proventos, on='Ticker', how='outer').fillna(0.0)
+    df_consolidado = pd.merge(df_base, df_ir, on='Ticker', how='left')
+    df_consolidado = pd.merge(df_consolidado, df_proventos, on='Ticker', how='left', suffixes=('', '_drop'))
     df_consolidado = pd.merge(df_consolidado, cnpj_b3, on='Ticker', how='left')
     
     df_consolidado['CNPJ'] = df_consolidado['CNPJ'].fillna("00.000.000/0000-00")
@@ -1346,16 +1352,19 @@ def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociac
         detalhes_dividendos = prov_ticker[prov_ticker['Categoria_IR'] == 'Dividendo'].to_dict(orient='records')
         detalhes_jcp = prov_ticker[prov_ticker['Categoria_IR'] == 'JCP'].to_dict(orient='records')
         detalhes_rendimentos = prov_ticker[prov_ticker['Categoria_IR'] == 'Rendimento'].to_dict(orient='records')
+        detalhes_reembolsos = prov_ticker[prov_ticker['Categoria_IR'] == 'Reembolso'].to_dict(orient='records')
         
+        quantidade_final = clean_val(row.get('Qtd Final'))
         # Montagem do objeto do Ticker
         item_carteira = {
             "ticker": ticker,
             "cnpj": row['CNPJ'],
             "razao_social": row['Razão Social'],
+            "possui_custodia_final": quantidade_final > 0,
             "custodia": {
-                "quantidade_final": float(row['Qtd Final']),
-                "total_investido": float(row['Total Investido']),
-                "preco_medio_ajustado": float(row['Preço Médio Ajustado'])
+                "quantidade_final": quantidade_final,
+                "total_investido": clean_val(row.get('Total Investido')),
+                "preco_medio_ajustado": clean_val(row.get('Preço Médio Ajustado'))
             },
             "totais_proventos": {
                 "dividendos": clean_val(row.get('Dividendo')),
@@ -1367,7 +1376,8 @@ def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociac
             "drill_down_negociacoes": detalhes_neg.to_dict(orient='records'),
             "drill_down_dividendos": detalhes_dividendos,
             "drill_down_jcp": detalhes_jcp,
-            "drill_down_rendimentos": detalhes_rendimentos
+            "drill_down_rendimentos": detalhes_rendimentos,
+            "drill_down_reembolsos": detalhes_reembolsos
         }
         
         lista_carteira_detalhada.append(item_carteira)
@@ -1479,7 +1489,7 @@ def _gerar_carteira_cache():
 
     df_historico_negociacoes=historico_negociacoes(df_ir,df_neg,df_mov,df_lucros)
     df_historico_negociacoes['Link_PDF'] = df_historico_negociacoes['Link_PDF'].fillna('-')
-    df_historico_proventos=historico_proventos(df_ir,df_mov,ano_fiscal)
+    df_historico_proventos=historico_proventos(df_proventos,df_mov,ano_fiscal)
     df_vendas=df_carteira[df_carteira['Qtd Final'] == 0]
     df_historico_vendas=historico_vendas(df_vendas,df_neg,df_mov,df_lucros)
         
