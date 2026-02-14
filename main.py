@@ -1,25 +1,16 @@
 # ---------------- CONFIGURAÇÕES ----------------
 import pandas as pd
-from pandas import (DataFrame,Series,concat,date_range,read_sql,to_datetime,to_numeric,Timestamp,DateOffset,NA,MultiIndex)
 import numpy as np
-from numpy import (floor as np_floor,inf as np_inf,isinf as np_isinf,where as np_where)
-from scipy.optimize import newton, brentq
 from datetime import datetime, timedelta
 import logging
 from fastapi.responses import JSONResponse
-import os, re, traceback
+import os, traceback
 from functools import lru_cache
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import requests
-import zipfile
-import io
-import pdfplumber
-from collections import Counter
-import unicodedata
 import exchange_calendars as ecals
 import math
 load_dotenv()
@@ -65,6 +56,8 @@ def carregar_dados():
         # df_neg = pd.read_sql("SELECT * FROM ldinvest_negociacao_21092025", con=engine)
         cnpj_b3 = pd.read_sql("SELECT * FROM cnpj_b3_total", con=engine)
         df_subscricao = pd.read_sql("SELECT * FROM base_precos_subscricao_total", con=engine)
+        df_provisionados = pd.read_sql("SELECT * FROM df_provisionados", con=engine)
+        incorporacoes_cvm = pd.read_sql("SELECT * FROM df_incorporacoes_cvm", con=engine)
         cnpj_complemento=pd.read_sql("SELECT * FROM cnpj_b3", con=engine)
         cnpj_complemento['Ticker'] = (
         cnpj_complemento['Ticker']
@@ -82,7 +75,7 @@ def carregar_dados():
 
         cnpj_b3=pd.concat([cnpj_b3, cnpj_complemento], ignore_index=True).drop_duplicates(subset=['CNPJ', 'Ticker'])
 
-        return df_mov, cnpj_b3, df_subscricao
+        return df_mov, cnpj_b3, df_subscricao,df_provisionados,incorporacoes_cvm
 
 def preparar_dados(df_mov,df_subscricao,ano_fiscal):
     # for col in ['Preço', 'Valor', 'Quantidade']:
@@ -161,6 +154,62 @@ def norm_str(s):
         s = s.str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8')
         return s
 
+def padroniza(df, origem,cols_alvo):
+        # Garante existência das colunas alvo (cria se faltar)
+        for c in cols_alvo:
+            if c not in df.columns:
+                df[c] = np.nan
+        
+        # Reordena e copia
+        out = df[cols_alvo].copy()
+
+        # Tipos
+        out['Data do Negócio'] = pd.to_datetime(out['Data do Negócio'], errors='coerce', dayfirst=True)
+        # Quantidade como inteiro se possível; senão, mantém numérico
+        out['Quantidade'] = pd.to_numeric(out['Quantidade'], errors='coerce')
+        # Se você tiver certeza que quantidade é sempre inteira: descomente a linha abaixo
+        # out['Quantidade'] = out['Quantidade'].round().astype('Int64')
+
+        out['Preço'] = pd.to_numeric(out['Preço'], errors='coerce')
+        out['Valor'] = pd.to_numeric(out['Valor'], errors='coerce')
+
+        # Normaliza Ticker
+        out['Ticker'] = out['Ticker'].astype(str).str.strip().str.upper()
+
+        # Normaliza Tipo de Movimentação (opcional, para consistência)
+        out['Tipo de Movimentação'] = out['Tipo de Movimentação'].astype(str).str.strip()
+
+        # Origem (para você saber de onde cada linha veio)
+        out['Origem'] = origem
+        return out
+
+def clean_val(val):
+        if pd.isna(val) or np.isinf(val):
+            return 0.0
+        return float(val)
+
+def resolver_ticker_mae(ticker_sub, tickers_consolidado):
+    """
+    ticker_sub: str  -> ex: 'ITSA1', 'ITSA2'
+    tickers_consolidado: iterable -> ex: consolidado['Ticker']
+    """
+    raiz = ticker_sub.rstrip('0123456789')
+    sufixo = ticker_sub[len(raiz):]
+
+    # Regra principal: subscrição
+    if sufixo == '1' and f'{raiz}3' in tickers_consolidado:
+        return f'{raiz}3'
+
+    if sufixo == '2' and f'{raiz}4' in tickers_consolidado:
+        return f'{raiz}4'
+
+
+    # Último fallback: retorna o próprio
+    return ticker_sub
+
+
+
+######### CONVERSÃO MOVIMENTAÇÕES EM NEGOCIAÇÕES
 def classificar_movimentacoes_v7(df_original):
     
     df = df_original.copy()
@@ -266,7 +315,9 @@ def verificar_origem_aluguel(row,emp_df,janela_dias=5):
             
         return False
 
-def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
+
+######## CONSOLIDAÇÃO DA CARTEIRA
+def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal,data_eventos_provisionados,incorporacoes_cvm):
     tipos_eventos = ['Desdobro', 'Grupamento', 'Incorporação', 
                      'Direitos de Subscrição - Exercido', 'Bonificação em Ativos']
 
@@ -274,12 +325,14 @@ def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
     
     fila_eventos = df_mov[df_mov['Movimentação'].isin(tipos_eventos)].copy()
     fila_eventos_neg = df_neg[df_neg['Tipo de Movimentação'].isin(tipos_eventos_neg)].copy()
+    fila_eventos_provisionados=pd.to_datetime(data_eventos_provisionados, dayfirst=True)
     fila_eventos['Data_DT'] = pd.to_datetime(fila_eventos['Data'], dayfirst=True)
     fila_eventos_neg['Data_DT'] = pd.to_datetime(fila_eventos_neg['Data do Negócio'], dayfirst=True)
     datas_eventos = sorted(
     pd.concat([
         fila_eventos['Data_DT'],
-        fila_eventos_neg['Data_DT']
+        fila_eventos_neg['Data_DT'],
+        pd.Series(fila_eventos_provisionados)
     ]).unique()
     )
 
@@ -294,38 +347,38 @@ def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
     data_inicio = pd.to_datetime('1900-01-01')
 
     for data_evento in datas_eventos:
-        # if data_evento == Timestamp('2020-07-10 00:00:00'):
-        #     break
         mask_neg = (pd.to_datetime(df_neg['Data do Negócio'], dayfirst=True) >= data_inicio) & \
                    (pd.to_datetime(df_neg['Data do Negócio'], dayfirst=True) < data_evento)
         neg_periodo = df_neg[mask_neg]
 
-        if not neg_periodo.empty:
-            consolidado = novo_consolidar_carteira(neg_periodo, base_inicial=consolidado)
+        consolidado = novo_consolidar_carteira(neg_periodo, base_inicial=consolidado)
 
         # PASSO B: Processar Eventos do Dia (Fiel às suas fórmulas)
         eventos_dia = fila_eventos[fila_eventos['Data_DT'] == data_evento]
         
         if eventos_dia.empty:
-            eventos_dia = fila_eventos_neg[fila_eventos_neg['Data_DT'] == data_evento]
-            for _, ev in eventos_dia.iterrows():
-                # break
-                ticker_original = ev['Ticker']
-                tickers_existentes = set(consolidado['Ticker'])
-                ticker_alvo = resolver_ticker_mae(ticker_original, tickers_existentes)
-                # Se o ticker_alvo (pai ou ele mesmo) não existe, criamos
-                if ticker_alvo not in consolidado['Ticker'].values:
-                    nova_linha = pd.DataFrame([{c: 0 for c in consolidado.columns}])
-                    nova_linha['Ticker'] = ticker_alvo
-                    nova_linha['Ticker Raiz'] = raiz_ticker(ticker_alvo)
-                    consolidado = pd.concat([consolidado, nova_linha], ignore_index=True)
+            eventos_dia_neg = fila_eventos_neg[fila_eventos_neg['Data_DT'] == data_evento]
+            if not eventos_dia_neg.empty:
+                for _, ev in eventos_dia_neg.iterrows():
+                    # break
+                    ticker_original = ev['Ticker']
+                    tickers_existentes = set(consolidado['Ticker'])
+                    ticker_alvo = resolver_ticker_mae(ticker_original, tickers_existentes)
+                    # Se o ticker_alvo (pai ou ele mesmo) não existe, criamos
+                    if ticker_alvo not in consolidado['Ticker'].values:
+                        nova_linha = pd.DataFrame([{c: 0 for c in consolidado.columns}])
+                        nova_linha['Ticker'] = ticker_alvo
+                        nova_linha['Ticker Raiz'] = raiz_ticker(ticker_alvo)
+                        consolidado = pd.concat([consolidado, nova_linha], ignore_index=True)
 
-                idx = consolidado[consolidado['Ticker'] == ticker_alvo].index[0]
-                preco_medio_antes_da_venda=consolidacao_final(consolidado,tickers_afetados_incorporacao).query('Ticker == @ticker_alvo')['Preço Médio Ajustado'].values[0]
-                # print(f"Preço médio antes da venda: {preco_medio_antes_da_venda}")
-                if ev['Tipo de Movimentação'] == 'Venda':
-                    investido = ev['Quantidade'] * preco_medio_antes_da_venda
-                    consolidado.at[idx, 'Total Investido'] -= investido
+                    idx = consolidado[consolidado['Ticker'] == ticker_alvo].index[0]
+                    preco_medio_antes_da_venda=consolidacao_final(consolidado,tickers_afetados_incorporacao).query('Ticker == @ticker_alvo')['Preço Médio Ajustado'].values[0]
+                    # print(f"Preço médio antes da venda: {preco_medio_antes_da_venda}")
+                    if ev['Tipo de Movimentação'] == 'Venda':
+                        investido = ev['Quantidade'] * preco_medio_antes_da_venda
+                        consolidado.at[idx, 'Total Investido'] -= investido
+            else:
+                consolidado=consolidado.copy() # Apenas para manter a consistência do processo, mesmo que não haja eventos 
         else:
             for _, ev in eventos_dia.iterrows():
                 
@@ -364,7 +417,7 @@ def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
                     # consolidado.at[idx, 'Total Investido'] += investido_b # ISSO É IMPORTANTE
                     # consolidado.at[idx, 'Qtd Compra'] += qtd_bonus
                 elif ev['Movimentação'] == 'Incorporação':
-                    res_inc = incorporacao(consolidado, df_mov, cnpj_b3)
+                    res_inc = incorporacao(consolidado, df_mov, cnpj_b3,incorporacoes_cvm)
                     tickers_afetados_incorporacao = res_inc[0] # Pega a lista de tickers "mortos"
                     ticker_sucessor = res_inc[1]
                     custo_total_acumulado = res_inc[2]
@@ -398,7 +451,7 @@ def processar_fluxo_historico(df_neg, df_mov,cnpj_b3,ano_fiscal):
     
     # Adicionamos o estado final (Hoje) ao histórico
     final_snap = consolidado.copy()
-    final_snap['Snapshot_Data'] = pd.Timestamp.now()
+    final_snap['Snapshot_Data'] = data_fim
     historico_snapshots.append(final_snap)
 
     return tickers_afetados_incorporacao,historico_snapshots
@@ -487,58 +540,7 @@ def aplicar_rendimentos_finais(df_consolidado, df_mov):
 
     return df_consolidado.fillna(0)
 
-def normalizar_texto(texto):
-    """Remove acentos e deixa tudo em minúsculo para comparação robusta."""
-    if not texto: return ""
-    texto = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
-    return texto.lower().strip()
-
-def limpar_razao_social(nome):
-    """Remove sufixos comuns que podem variar no PDF (S.A., S/A, Ltda)."""
-    nome = normalizar_texto(nome)
-    # Remove S.A, S/A, SA, LTDA, S.A., etc.
-    nome = re.sub(r'\b(s/?a|ltda|participacoes|energia|brasil)\b', '', nome)
-    # Pega apenas as duas primeiras palavras (geralmente o nome 'core' da empresa)
-    palavras = nome.split()
-    return " ".join(palavras[:2]) if len(palavras) >= 2 else nome
-
-def mapear_incorporada_pela_carteira_v2(texto_pdf, df_minha_carteira, cnpj_sucessor):
-    """
-    1. Tenta por CNPJ (Precisão Máxima).
-    2. Se falhar, tenta por Palavras-Chave da Razão Social (Segurança).
-    """
-    texto_norm = normalizar_texto(texto_pdf)
-    
-    # --- PASSO 1: BUSCA POR CNPJ ---
-    regex_cnpj = r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})"
-    cnpjs_no_texto = set(re.findall(regex_cnpj, texto_pdf))
-    cnpjs_no_texto.discard(cnpj_sucessor)
-    
-    cnpjs_carteira = set(df_minha_carteira['CNPJ'].unique())
-    encontrados_cnpj = cnpjs_no_texto.intersection(cnpjs_carteira)
-    
-    if encontrados_cnpj:
-        return list(encontrados_cnpj)[0]
-
-    # --- PASSO 2: BUSCA POR RAZÃO SOCIAL (Se o CNPJ falhar) ---
-    print("CNPJ não encontrado. Iniciando busca por Razão Social...")
-    
-    # Filtra a carteira para não buscar a própria empresa sucessora
-    df_busca = df_minha_carteira[df_minha_carteira['CNPJ'] != cnpj_sucessor]
-    for _, row in df_busca.iterrows():
-        
-        nome_original = row['Razão Social']
-        termo_busca = limpar_razao_social(nome_original)
-        
-        # Usamos regex com \b para garantir que estamos achando a palavra inteira
-        # Ex: evitar que 'AES' dê match em 'AESTHETIC'
-        if re.search(rf"\b{re.escape(termo_busca)}\b", texto_norm):
-            print(f"🎯 Match por Nome: '{termo_busca}' encontrado (Ref: {nome_original})")
-            return row['CNPJ']
-            
-    return None
-
-def incorporacao(df, df_mov, cnpj_b3):
+def incorporacao(df, df_mov, cnpj_b3,incorporacoes_cvm):
 
     cnpj_b3['Raiz'] = cnpj_b3['Ticker'].apply(raiz_ticker)
     cnpj_b3_unique = cnpj_b3.drop_duplicates(subset=['Raiz'])[['Raiz', 'CNPJ', 'Razão Social']]
@@ -550,20 +552,6 @@ def incorporacao(df, df_mov, cnpj_b3):
     df = df.merge(cnpj_b3_unique, on='Raiz', how='left')
     tickers_sucessores = incorporacoes_na_b3['Ticker'].unique().tolist()
     if not incorporacoes_na_b3.empty:
-        ANO_ALVO = incorporacoes_na_b3['Data'].dt.year.min()
-
-        URL_CVM = f"http://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/IPE/DADOS/ipe_cia_aberta_{ANO_ALVO}.zip"
-        print(f"Lendo base da CVM para {ANO_ALVO}...")
-        r = requests.get(URL_CVM)
-        z = zipfile.ZipFile(io.BytesIO(r.content))
-        csv_nome = [f for f in z.namelist() if f.endswith('.csv')][0]
-        df_cvm = pd.read_csv(z.open(csv_nome), sep=';', encoding='ISO-8859-1')
-
-        # Filtros base da CVM para documentos de incorporação
-        cond_docs = (df_cvm['Assunto'].str.contains("Incorporação", case=False, na=False)) & \
-                    (df_cvm['Categoria'].isin(['Aviso aos Acionistas', 'Fato Relevante']))
-        df_cvm_filtrado = df_cvm[cond_docs].copy()
-
         for ticker_sucessor in tickers_sucessores:
             print(f"\n--- Analisando Incorporação para o Ticker: {ticker_sucessor} ---")
 
@@ -574,32 +562,30 @@ def incorporacao(df, df_mov, cnpj_b3):
                 continue
         
             cnpj_sucessor = match_cnpj.iloc[0]['CNPJ']
-        
-            # Filtra na base da CVM apenas documentos deste Ticker (Sucessor)
-            docs_do_ticker = df_cvm_filtrado[df_cvm_filtrado['CNPJ_Companhia'] == cnpj_sucessor]
-        
-            if docs_do_ticker.empty:
-                print(f"❌ Nenhum documento de incorporação encontrado na CVM para o CNPJ {cnpj_sucessor}")
-                continue
 
             custo_total_acumulado = 0
     encontrou_e_processou = False # Flag para parar a busca em outros PDFs
 
-    for _, row_doc in docs_do_ticker.iterrows():
-        if encontrou_e_processou:
-            break # Interrompe o loop de PDFs se já resolvemos a migração
+    mask_sucessor = incorporacoes_cvm['CNPJ_Sucessor'] == cnpj_sucessor
+    mask_incorporada = incorporacoes_cvm['CNPJ_Incorporada'] == cnpj_sucessor
 
-        print(f"📄 Analisando documento: {row_doc['Assunto']}...")
-        texto_pdf = ler_pdf_da_url(row_doc['Link_Download'])
-        
-        cnpj_antecessor_encontrado = mapear_incorporada_pela_carteira_v2(
-            texto_pdf, 
-            df_minha_carteira=df[df['CNPJ'].notna()][['CNPJ', 'Razão Social']],
-            cnpj_sucessor=cnpj_sucessor
-        )
-            
-        if cnpj_antecessor_encontrado:
-            tickers_afetados = cnpj_b3[cnpj_b3['CNPJ'] == cnpj_antecessor_encontrado]['Ticker'].unique().tolist()
+    resultado = incorporacoes_cvm.loc[
+            mask_sucessor | mask_incorporada
+        ]
+
+    cnpj_antecessor_encontrado = (
+            resultado.apply(
+                lambda row: (
+                    row['CNPJ_Incorporada']
+                    if row['CNPJ_Sucessor'] == cnpj_sucessor
+                    else row['CNPJ_Sucessor']
+                ),
+                axis=1
+            )
+        ).values
+    cnpj_antecessor_encontrado = df[df['CNPJ'].isin(cnpj_antecessor_encontrado)]['CNPJ'].unique().tolist()
+    if cnpj_antecessor_encontrado:
+            tickers_afetados = cnpj_b3[cnpj_b3['CNPJ'].isin(cnpj_antecessor_encontrado)]['Ticker'].unique().tolist()
             print(f"🎯 Match encontrado! O PDF cita {tickers_afetados}.")
 
             # Processar cada ticker da empresa que está "morrendo"
@@ -623,20 +609,6 @@ def incorporacao(df, df_mov, cnpj_b3):
         return (tickers_afetados,ticker_sucessor, custo_total_acumulado, qtd_inc_b3)
     
     return None # Caso nenhum PDF tenha dado match
-
-def ler_pdf_da_url(url):
-    """Baixa o PDF e lê o conteúdo sem salvar em disco."""
-    try:
-        response = requests.get(url, timeout=15)
-        # Transforma os bytes do download em um arquivo 'virtual' na memória
-        with pdfplumber.open(io.BytesIO(response.content)) as pdf:
-            texto = ""
-            for pagina in pdf.pages:
-                texto += pagina.extract_text() + "\n"
-        return texto
-    except Exception as e:
-        print(f"Erro ao ler PDF da URL: {e}")
-        return ""
 
 def consolidacao_final(df,tickers_afetados_incorporacao):
     # Migra para o sucessor
@@ -706,6 +678,7 @@ def cisao(df_carteira,df_mov):
 
     return(df_carteira)
 
+######## Provento recebido no ano fiscal (para IR)
 def calcular_proventos_ir(df_mov,ano_fiscal):
     # 1. Preparação das datas
     df_mov['Data'] = pd.to_datetime(df_mov['Data'], dayfirst=True)
@@ -758,6 +731,8 @@ def calcular_proventos_ir(df_mov,ano_fiscal):
 
     return df_pivot_rend
 
+
+####### Vendas e Lucros para IR (com lógica de reset de PM a cada venda total)
 def calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao):
 
 
@@ -928,110 +903,7 @@ def calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,ticke
     
     return df_lucros_completo
 
-def buscar_documentos_custo_cisao(ticker_mae, cnpj_mae, data_evento, df_cvm_anual):
-    """
-    Retorna apenas os documentos com altíssima probabilidade de conter 
-    o fator de custo de uma cisão específica.
-    """
-    # Converter data para datetime para criar a janela
-    data_dt = pd.to_datetime(data_evento)
-    inicio_janela = data_dt - pd.Timedelta(days=15) # 15 dias antes
-    fim_janela = data_dt + pd.Timedelta(days=60)    # Até 60 dias depois (comum demorar)
-    
-    df_busca = df_cvm_anual.copy()
-    df_busca['Data_Referencia'] = df_busca['Data_Referencia'].astype(str).str.strip()
-
-    # 2. Conversão especificando o formato exato
-    df_busca['Data_Referencia_DT'] = pd.to_datetime(
-        df_busca['Data_Referencia'], 
-        format='%Y-%m-%d', 
-        errors='coerce' # Se houver algo bizarro, vira NaT em vez de dar erro
-    )
-
-    # 1. Filtro Inicial: Empresa correta e Janela de tempo
-    mask = (df_busca['CNPJ_Companhia'] == cnpj_mae) & \
-            (pd.to_datetime(df_busca['Data_Referencia_DT']) >= inicio_janela) & \
-            (pd.to_datetime(df_busca['Data_Referencia_DT']) <= fim_janela)
-
-    docs_empresa = df_busca[mask].copy()
-    # 2. Filtro de Categorias Relevantes (Fato Relevante e Comunicado ao Mercado)
-    # Na CVM: 'Fato Relevante' e 'Comunicado ao Mercado'
-    categorias_alvo = ['Fato Relevante', 'Comunicado ao Mercado', 'Aviso aos Acionistas']
-    docs_empresa = docs_empresa[docs_empresa['Categoria'].isin(categorias_alvo)]
-
-    # 3. Busca por Palavras-Chave de "Custo" (Ouro do documento)
-    # Termos que indicam que o documento fala de IR/Custo
-    termos_ouro = r'(custo|aquisicao|imposto|renda|alocacao|rateio|proporcao)'
-    
-    # Criamos uma coluna de relevância
-    docs_empresa['Score'] = docs_empresa['Assunto'].str.contains(termos_ouro, case=False, na=False).astype(int)
-    
-    # Adicionamos bônus se o assunto for especificamente "Custo de Aquisição"
-    docs_empresa.loc[docs_empresa['Assunto'].str.contains('custo', case=False, na=False), 'Score'] += 2
-
-    # Retorna apenas os que têm score > 0, ordenados pelos mais prováveis
-    return docs_empresa[docs_empresa['Score'] > 0].sort_values(by='Score', ascending=False)
-
-def extrair_pontuacao_cnpjs(texto_pdf, cnpj_incorporadora):
-    """
-    Analisa o texto e retorna um dicionário com CNPJ: Pontuação.
-    """
-    # Regex para CNPJ (flexível para espaços e prefixos)
-    regex_cnpj = r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})"
-    cnpjs_encontrados = re.findall(regex_cnpj, texto_pdf)
-    
-    # Se não achar nada, retorna vazio
-    if not cnpjs_encontrados:
-        return {}
-
-    # 1. Limpeza: Remover o CNPJ da própria incorporadora
-    # (Usamos strip e padronização para evitar erros de comparação)
-    candidatos_brutos = [c.strip() for c in cnpjs_encontrados if c.strip() != cnpj_incorporadora]
-    
-    # 2. Contagem de frequência
-    contagem = Counter(candidatos_brutos)
-    
-    scores = {}
-    for i, cnpj in enumerate(candidatos_brutos):
-        if cnpj not in scores:
-            # Pontuação baseada na frequência
-            scores[cnpj] = contagem[cnpj] * 2
-            
-            # Bônus de posição (os primeiros citados costumam ser a incorporada)
-            if i == 0: scores[cnpj] += 10
-            elif i == 1: scores[cnpj] += 5
-            
-    return scores
-
-def padroniza(df, origem,cols_alvo):
-        # Garante existência das colunas alvo (cria se faltar)
-        for c in cols_alvo:
-            if c not in df.columns:
-                df[c] = np.nan
-        
-        # Reordena e copia
-        out = df[cols_alvo].copy()
-
-        # Tipos
-        out['Data do Negócio'] = pd.to_datetime(out['Data do Negócio'], errors='coerce', dayfirst=True)
-        # Quantidade como inteiro se possível; senão, mantém numérico
-        out['Quantidade'] = pd.to_numeric(out['Quantidade'], errors='coerce')
-        # Se você tiver certeza que quantidade é sempre inteira: descomente a linha abaixo
-        # out['Quantidade'] = out['Quantidade'].round().astype('Int64')
-
-        out['Preço'] = pd.to_numeric(out['Preço'], errors='coerce')
-        out['Valor'] = pd.to_numeric(out['Valor'], errors='coerce')
-
-        # Normaliza Ticker
-        out['Ticker'] = out['Ticker'].astype(str).str.strip().str.upper()
-
-        # Normaliza Tipo de Movimentação (opcional, para consistência)
-        out['Tipo de Movimentação'] = out['Tipo de Movimentação'].astype(str).str.strip()
-
-        # Origem (para você saber de onde cada linha veio)
-        out['Origem'] = origem
-        return out
-    
+####### Drill down
 def filtra_pos_venda_total(df, data_col,cutoff_por_ticker):
     out = df.merge(cutoff_por_ticker.rename('cutoff'),
                 left_on='Ticker', right_index=True, how='left')
@@ -1047,25 +919,6 @@ def filtra_pre_venda_total(df, data_col,cutoff_por_ticker):
     mask = out['cutoff'].isna() | (out[data_col] <= out['cutoff'])
     out = out.loc[mask].drop(columns=['cutoff'])
     return out
-
-def resolver_ticker_mae(ticker_sub, tickers_consolidado):
-    """
-    ticker_sub: str  -> ex: 'ITSA1', 'ITSA2'
-    tickers_consolidado: iterable -> ex: consolidado['Ticker']
-    """
-    raiz = ticker_sub.rstrip('0123456789')
-    sufixo = ticker_sub[len(raiz):]
-
-    # Regra principal: subscrição
-    if sufixo == '1' and f'{raiz}3' in tickers_consolidado:
-        return f'{raiz}3'
-
-    if sufixo == '2' and f'{raiz}4' in tickers_consolidado:
-        return f'{raiz}4'
-
-
-    # Último fallback: retorna o próprio
-    return ticker_sub
 
 def historico_vendas(df_vendas,df_neg,df_mov,df_lucros_novo):
     tickers_atuais=df_vendas['Ticker']
@@ -1289,31 +1142,40 @@ def historico_proventos(df_proventos, df_mov, ano_fiscal):
     
     return df_hist_prov
 
-def agrupar_emprestimos_proximos(df_emp):
-            df = df_emp.copy()
-            
-            # 1. Garantir ordenação para comparar linhas subsequentes
-            df = df.sort_values(['Ticker', 'Data'])
-            
-            # 2. Identificar quebras: Se mudou o Ticker OU se a diferença de dias > 1
-            # diff() calcula a diferença para a linha de cima
-            diff_dias = df.groupby('Ticker')['Data'].diff().dt.days
-            
-            # Se diff_dias > 1, marca como True (nova sequência)
-            nova_sequencia = (diff_dias > 1) | (diff_dias.isna())
-            
-            # 3. Criar o ID do grupo usando a soma acumulada (cumsum)
-            # Cada vez que 'nova_sequencia' é True, o número do grupo aumenta
-            df['grupo_id'] = nova_sequencia.cumsum()
-            
-            # 4. Agrupar de fato
-            df_agrupado = df.groupby(['grupo_id', 'Ticker'], as_index=False).agg({
-                'Data': 'max',             # Mantém a maior data
-                'Quantidade': 'sum',       # Soma as quantidades
-                '_Qty_Match': 'sum'        # Soma o campo de match também
-            })
-            
-            return df_agrupado.drop(columns=['grupo_id'])
+######### proventos provisionados
+def extrair_data_provisionado(tickers_provisionados,df_provisionados):
+    tickers_set = pd.Index([str(t).strip().upper() for t in tickers_provisionados])
+    df_provisionado_ajustado = df_provisionados[df_provisionados['Ticker'].isin(tickers_set)].copy()
+    data_eventos_provisionados2 = df_provisionado_ajustado['data_com'].dt.strftime('%Y-%d-%m').unique().tolist()
+    return data_eventos_provisionados2, df_provisionado_ajustado
+
+def proventos_provisionados(df_carteira_final_historico,df_provisionado_ajustado):
+    # juntar todos os dfs da lista
+    colunas_necessarias = ['Snapshot_Data','Ticker', 'Qtd Compra', 'Qtd Bonus', 'Qtd_subscr', 'Quantidade_Desdobro', 'Qtd incorporada', 'Qtd Vendida']
+
+    df_historico = pd.concat(
+        [df[colunas_necessarias] for df in df_carteira_final_historico],
+        ignore_index=True
+    )
+
+    df_historico['Qtd Final'] = df_historico['Qtd Compra'] + df_historico['Qtd Bonus'] + df_historico['Qtd_subscr'] + df_historico['Quantidade_Desdobro'] + df_historico['Qtd incorporada'].fillna(0) - df_historico['Qtd Vendida']
+
+    # garantir datetime
+
+    df_merge = df_provisionado_ajustado.merge(
+        df_historico,
+        left_on=['Ticker', 'data_com'],
+        right_on=['Ticker', 'Snapshot_Data'],
+        how='left'
+    )
+    df_merge['valor'] = pd.to_numeric(df_merge['valor'], errors='coerce')
+    df_merge['valor_provisionado'] = df_merge['Qtd Final'] * df_merge['valor']
+
+    df_final_provisionado = df_merge.groupby(['Ticker', 'data_com','tipo'], as_index=False)['valor_provisionado'].sum()
+    df_final_provisionado=df_final_provisionado[df_final_provisionado['valor_provisionado'] > 0].copy()
+    return df_final_provisionado
+
+######## JSON para FRONT
 
 def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociacoes, df_historico_proventos,df_historico_vendas, ano_fiscal):
     """
@@ -1437,12 +1299,6 @@ def gerar_json_ir(df_ir, df_proventos, cnpj_b3, df_lucros, df_historico_negociac
         "carteira": lista_carteira_detalhada
     }
 
-def clean_val(val):
-        if pd.isna(val) or np.isinf(val):
-            return 0.0
-        return float(val)
-# 4. Nova Lógica de Verificação (Individual e Soma)
-
 # ---------------- ROTAS ----------------
 @app.get("/")
 def root():
@@ -1459,27 +1315,21 @@ _last_cache_time = datetime.min
 def _gerar_carteira_cache():
     print("♻️  Recalculando carteira completa...")
 
-    df_mov, cnpj_b3,df_subscricao= carregar_dados()
+    df_mov, cnpj_b3,df_subscricao,df_provisionados,incorporacoes_cvm= carregar_dados()
     df_mov= preparar_dados(df_mov,df_subscricao,ano_fiscal)
     df_neg = classificar_movimentacoes_v7(df_mov)
-
-    tickers_afetados_incorporacao,df_carteira_final_historico = processar_fluxo_historico(df_neg,df_mov,cnpj_b3,ano_fiscal)
+    tickers_provisionados = df_neg['Ticker'].unique()
+    datas_provisionadas,df_provisionado_ajustado=extrair_data_provisionado(tickers_provisionados,df_provisionados)
+    tickers_afetados_incorporacao,df_carteira_final_historico = processar_fluxo_historico(df_neg,df_mov,cnpj_b3,ano_fiscal,datas_provisionadas,incorporacoes_cvm)
     df_carteira_final=df_carteira_final_historico[-1]
-
+    df_final_provisionado = proventos_provisionados(df_carteira_final_historico,df_provisionado_ajustado)
     # ---- Cálculos resumidos ----
     df_lucros = calcular_lucros_vendas_novo(df_neg, df_mov,df_carteira_final_historico,tickers_afetados_incorporacao)
-    # df_lucros = calcular_lucros_vendas(df_neg, df_mov, desdobros, subscricoes, bonus, leilao, ajuste_grupamento,cnpj_b3)
-    # desdobros, subscricoes, subscricoes_original, bonus, bonus_original, leilao, leilao_original = processar_eventos(df_mov)
-    # ajuste_grupamento = aplicar_grupamentos(df_mov, df_neg, desdobros, subscricoes, bonus, leilao, cnpj_b3)
-    # df = consolidar_carteira(df_neg, desdobros, subscricoes, bonus, leilao)
-    # ticker_sucessor, custo_total_acumulado,incorporacoes_na_b3=incorporacao(df, df_mov, cnpj_b3)
+    
     df_carteira = consolidacao_final(df_carteira_final,tickers_afetados_incorporacao)
-    # df_carteira = df_carteira[~df_carteira['Ticker'].isin([a['Ticker'] for a in ajuste_grupamento])]
-        
-    # df_carteira = pd.concat([df_carteira, pd.DataFrame(ajuste_grupamento)], ignore_index=True)
+    
     df_carteira = cisao(df_carteira,df_mov)
-    # df_carteira_filtrada = df_carteira[df_carteira['Qtd Final'] > 0].copy()
-
+    
 
     proventos_pivot_ir = calcular_proventos_ir(df_mov,ano_fiscal)
     df = df_carteira.iloc[:-1].merge(proventos_pivot_ir, on="Ticker", how="left")
